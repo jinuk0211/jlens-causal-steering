@@ -7,14 +7,14 @@ text without vendoring or silently drifting from upstream.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable
+
+from jlens_causal import benchmark
 
 
 @dataclass(frozen=True)
@@ -37,23 +37,9 @@ class ParsedCall:
 
 
 def load_toolalign_common(root: Path) -> ModuleType:
-    source = root / "jlens_experiment" / "toolalign_common.py"
-    if not source.is_file():
-        raise FileNotFoundError(source)
-    name = f"_jlens_causal_toolalign_{abs(hash(str(source)))}"
-    spec = importlib.util.spec_from_file_location(name, source)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {source}")
-    module = importlib.util.module_from_spec(spec)
-    # Dataclasses and typing resolve the defining module through sys.modules.
-    # Register it before executing the dynamically loaded benchmark adapter.
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(name, None)
-        raise
-    return module
+    """Return the bundled adapter after validating the public checkout."""
+    benchmark.repository_root(root)
+    return benchmark
 
 
 def load_cases(

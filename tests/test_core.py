@@ -61,7 +61,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(specs), 18)
         self.assertEqual(sum(spec.method == "baseline" for spec in specs), 2)
 
-    def test_toolalign_selection_and_dynamic_dataclasses(self) -> None:
+    def test_toolalign_selection_from_public_checkout(self) -> None:
         config = load_config(ROOT / "configs" / "smoke.json")
         _, cases = load_cases(
             config.toolalign_root,
