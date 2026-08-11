@@ -155,6 +155,7 @@ tmux new -s jlens
 source /workspace/jlens-causal-steering/.venv/bin/activate
 export HF_HOME=/workspace/.cache/huggingface
 cd /workspace/jlens-causal-steering
+mkdir -p outputs
 jlens-causal all configs/qwen35_toolalign_pilot.json 2>&1 | tee outputs/full-pilot.log
 ```
 
