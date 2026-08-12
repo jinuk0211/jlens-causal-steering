@@ -20,6 +20,21 @@ class ModelRuntime:
 
 
 @dataclass(frozen=True)
+class RenderedPrompt:
+    """Tokenized chat prompt with exact semantic segment positions."""
+
+    input_ids: Any
+    attention_mask: Any
+    user_positions: tuple[int, ...]
+    system_positions: tuple[int, ...]
+
+    def __iter__(self):
+        """Keep two-value unpacking compatibility with the v1 helper."""
+        yield self.input_ids
+        yield self.attention_mask
+
+
+@dataclass(frozen=True)
 class GenerationResult:
     text: str
     completion_ids: list[int]
@@ -86,8 +101,47 @@ def load_runtime(model_config: dict[str, Any]) -> ModelRuntime:
     )
 
 
-def render_messages(runtime: ModelRuntime, messages: list[dict[str, str]]) -> tuple[Any, Any]:
-    """Render once and return input IDs plus an all-ones attention mask."""
+def _content_positions(offsets: list[tuple[int, int]], *, start: int, end: int) -> tuple[int, ...]:
+    return tuple(
+        index
+        for index, (left, right) in enumerate(offsets)
+        if right > left and right > start and left < end
+    )
+
+
+def render_messages(runtime: ModelRuntime, messages: list[dict[str, str]]) -> RenderedPrompt:
+    """Render once and retain exact system/user token spans.
+
+    Segment-aware intervention masks are derived from character offsets in the
+    rendered chat template. The token IDs are checked against the template's
+    native tokenized form so a tokenizer/template drift fails loudly.
+    """
+    if len(messages) != 2 or [item.get("role") for item in messages] != ["system", "user"]:
+        raise ValueError("the isolated pilot requires exactly one system and one user message")
+    rendered_text = runtime.tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    if not isinstance(rendered_text, str):
+        raise TypeError("chat template did not return text")
+    system_text = str(messages[0]["content"])
+    user_text = str(messages[1]["content"])
+    system_start = rendered_text.find(system_text)
+    user_start = rendered_text.rfind(user_text)
+    if system_start < 0 or user_start < 0 or user_start <= system_start:
+        raise ValueError("could not locate system/user content in the rendered chat template")
+
+    with_offsets = runtime.tokenizer(
+        rendered_text,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+        return_tensors="pt",
+    )
+    offset_ids = with_offsets["input_ids"]
+    offsets_value = with_offsets["offset_mapping"]
+    offsets = [tuple(map(int, pair)) for pair in offsets_value[0].tolist()]
     encoded = runtime.tokenizer.apply_chat_template(
         messages,
         tokenize=True,
@@ -106,12 +160,44 @@ def render_messages(runtime: ModelRuntime, messages: list[dict[str, str]]) -> tu
         attention_mask = None
     if input_ids.ndim == 1:
         input_ids = input_ids.unsqueeze(0)
+    if offset_ids.ndim == 1:
+        offset_ids = offset_ids.unsqueeze(0)
+    if input_ids.detach().cpu().tolist() != offset_ids.detach().cpu().tolist():
+        special_id = getattr(runtime.tokenizer, "bos_token_id", None)
+        offset_values = offset_ids.detach().cpu().tolist()
+        input_values = input_ids.detach().cpu().tolist()
+        if (
+            special_id is not None
+            and len(input_values[0]) == len(offset_values[0]) + 1
+            and input_values[0][0] == int(special_id)
+            and input_values[0][1:] == offset_values[0]
+        ):
+            offsets.insert(0, (0, 0))
+        else:
+            raise ValueError("chat-template tokens disagree with offset-mapped tokenizer output")
+    user_positions = _content_positions(
+        offsets,
+        start=user_start,
+        end=user_start + len(user_text),
+    )
+    system_positions = _content_positions(
+        offsets,
+        start=system_start,
+        end=system_start + len(system_text),
+    )
+    if not user_positions or not system_positions:
+        raise ValueError("rendered prompt has an empty system or user token span")
     input_ids = input_ids.to(runtime.device)
     if attention_mask is None:
         attention_mask = runtime.torch.ones_like(input_ids)
     elif attention_mask.ndim == 1:
         attention_mask = attention_mask.unsqueeze(0)
-    return input_ids, attention_mask.to(runtime.device)
+    return RenderedPrompt(
+        input_ids=input_ids,
+        attention_mask=attention_mask.to(runtime.device),
+        user_positions=user_positions,
+        system_positions=system_positions,
+    )
 
 
 def token_ids_sha256(input_ids: Any) -> str:

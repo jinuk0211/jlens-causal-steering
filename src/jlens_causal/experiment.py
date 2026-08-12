@@ -6,6 +6,7 @@ import hashlib
 import json
 import time
 from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -14,17 +15,30 @@ from jlens_causal.directions import load_directions
 from jlens_causal.interventions import (
     AdditiveOperator,
     CoordinateSwapOperator,
+    finalize_thought_trace,
+    intervention_band_hooks,
     intervention_hook,
+    matched_prompt_positions,
+    thought_trace_hook,
 )
-from jlens_causal.modeling import ModelRuntime, generate_text, render_messages, token_ids_sha256
+from jlens_causal.modeling import (
+    ModelRuntime,
+    RenderedPrompt,
+    generate_text,
+    render_messages,
+    token_ids_sha256,
+)
 from jlens_causal.toolalign import ScenarioCase, classify_behavior, load_cases, messages_for_case
 
-RECORD_SCHEMA_VERSION = "jlens-causal-record-v2"
-MANIFEST_SCHEMA_VERSION = "jlens-causal-run-v2"
+RECORD_SCHEMA_VERSION = "jlens-causal-record-v3"
+MANIFEST_SCHEMA_VERSION = "jlens-causal-run-v3"
 GENERATED_ARTIFACTS = (
     "directions.pt",
+    "target_selection.json",
     "manifest.json",
     "runs.jsonl",
+    "thought_trajectories.csv",
+    "behavior_profiles.csv",
     "trial_metrics.csv",
     "summary.csv",
 )
@@ -45,6 +59,8 @@ class TrialSpec:
     position_policy: str | None
     site: str
     random_seed: int | None = None
+    vector_layer_band: tuple[int, ...] | None = None
+    applied_layer_band: tuple[int, ...] | None = None
 
 
 def _stable_hash(payload: dict[str, Any]) -> str:
@@ -189,35 +205,35 @@ def iter_trial_specs(config: PilotConfig) -> Iterator[TrialSpec]:
                                     random_seed=random_seed,
                                 )
 
-                        if sweep["include_paper_coordinate_swap"]:
-                            for alpha in map(float, sweep["coordinate_swap_alphas"]):
-                                for site, applied_layer, position in (
-                                    ("candidate", layer, sweep["position_policy"]),
-                                    (
-                                        "wrong_layer",
-                                        int(sweep["wrong_layer"]),
-                                        sweep["position_policy"],
-                                    ),
-                                    (
-                                        "wrong_position",
-                                        layer,
-                                        sweep.get("wrong_position_policy", "prompt_first"),
-                                    ),
-                                ):
-                                    yield TrialSpec(
-                                        domain=domain,
-                                        document=int(document),
-                                        condition=condition,
-                                        source_scenario=source,
-                                        target_scenario=target,
-                                        direction=direction,
-                                        method="jlens_swap",
-                                        vector_layer=layer,
-                                        applied_layer=applied_layer,
-                                        alpha=alpha,
-                                        position_policy=position,
-                                        site=site,
-                                    )
+                    if sweep["include_paper_coordinate_swap"]:
+                        candidate_band = tuple(map(int, sweep["coordinate_swap_layers"]))
+                        wrong_band = tuple(map(int, sweep["wrong_layer_band"]))
+                        for alpha in map(float, sweep["coordinate_swap_alphas"]):
+                            for site, applied_band, position in (
+                                ("candidate", candidate_band, sweep["position_policy"]),
+                                ("wrong_layer", wrong_band, sweep["position_policy"]),
+                                (
+                                    "wrong_position",
+                                    candidate_band,
+                                    sweep["wrong_position_policy"],
+                                ),
+                            ):
+                                yield TrialSpec(
+                                    domain=domain,
+                                    document=int(document),
+                                    condition=condition,
+                                    source_scenario=source,
+                                    target_scenario=target,
+                                    direction=direction,
+                                    method="jlens_swap",
+                                    vector_layer=None,
+                                    applied_layer=None,
+                                    alpha=alpha,
+                                    position_policy=position,
+                                    site=site,
+                                    vector_layer_band=candidate_band,
+                                    applied_layer_band=applied_band,
+                                )
 
 
 def _case_map(cases: list[ScenarioCase]) -> dict[tuple[str, int, str], ScenarioCase]:
@@ -262,20 +278,37 @@ def _operator_for(spec: TrialSpec, artifact: dict[str, Any]) -> Any:
     if spec.vector_layer is None:
         raise ValueError("intervention trial has no vector layer")
     layer_data = artifact["layers"][int(spec.vector_layer)]
-    if spec.method == "jlens_swap":
-        return CoordinateSwapOperator(
-            concept_a=layer_data["j_concept_a"],
-            concept_b=layer_data["j_concept_b"],
-            alpha=spec.alpha,
-        )
     if spec.method == "random":
         if spec.random_seed is None:
             raise ValueError("random trial has no seed")
-        vector = layer_data["random"][int(spec.random_seed)]
+        vector = layer_data["random"][spec.direction][int(spec.random_seed)]
     else:
-        vector = layer_data[spec.method]
-    sign = 1.0 if spec.direction == "a_to_b" else -1.0
-    return AdditiveOperator(vector=vector, alpha=spec.alpha, sign=sign)
+        vector = layer_data[spec.method][spec.direction]
+    return AdditiveOperator(vector=vector, alpha=spec.alpha)
+
+
+def _swap_operators(spec: TrialSpec, artifact: dict[str, Any]) -> list[tuple[int, Any]]:
+    if spec.vector_layer_band is None or spec.applied_layer_band is None:
+        raise ValueError("coordinate swap trial has no layer band")
+    if len(spec.vector_layer_band) != len(spec.applied_layer_band):
+        raise ValueError("coordinate swap layer bands have different widths")
+    operators: list[tuple[int, Any]] = []
+    for vector_layer, applied_layer in zip(
+        spec.vector_layer_band, spec.applied_layer_band, strict=True
+    ):
+        layer_data = artifact["layers"][int(vector_layer)]
+        operators.append(
+            (
+                int(applied_layer),
+                CoordinateSwapOperator(
+                    concept_a=layer_data["concept_a"],
+                    concept_b=layer_data["concept_b"],
+                    alpha=spec.alpha,
+                    direction=spec.direction,
+                ),
+            )
+        )
+    return operators
 
 
 def _record_manifest(config: PilotConfig, planned: int) -> None:
@@ -310,9 +343,12 @@ def run_sweep(
         raise AssertionError(f"planned {len(all_specs)} trials but count estimator says {expected}")
     if int(config.sweep["wrong_layer"]) >= runtime.lens_model.n_layers:
         raise ValueError("wrong_layer is outside the loaded model")
-    for layer in config.sweep["layers"]:
+    for layer in [
+        *config.sweep["coordinate_swap_layers"],
+        *config.sweep["wrong_layer_band"],
+    ]:
         if int(layer) >= runtime.lens_model.n_layers:
-            raise ValueError(f"candidate layer {layer} is outside the loaded model")
+            raise ValueError(f"intervention layer {layer} is outside the loaded model")
 
     common, cases = load_cases(
         config.toolalign_root,
@@ -324,7 +360,7 @@ def run_sweep(
     completed = _completed_ids(config)
     _record_manifest(config, len(all_specs))
     stats = {"planned": len(all_specs), "already_complete": 0, "written": 0}
-    prompt_cache: dict[tuple[str, int, str, str], tuple[Any, Any, str]] = {}
+    prompt_cache: dict[tuple[str, int, str, str], tuple[RenderedPrompt, str]] = {}
 
     with config.records_path.open("a", encoding="utf-8", buffering=1) as sink:
         for spec in all_specs:
@@ -340,33 +376,53 @@ def run_sweep(
             cached = prompt_cache.get(cache_key)
             if cached is None:
                 messages = messages_for_case(common, case, spec.condition)
-                input_ids, attention_mask = render_messages(runtime, messages)
-                cached = (input_ids, attention_mask, token_ids_sha256(input_ids))
+                prompt = render_messages(runtime, messages)
+                cached = (prompt, token_ids_sha256(prompt.input_ids))
                 prompt_cache[cache_key] = cached
-            input_ids, attention_mask, prompt_hash = cached
+            prompt, prompt_hash = cached
 
             started = time.perf_counter()
-            if spec.method == "baseline":
+            with ExitStack() as stack:
+                trace = stack.enter_context(
+                    thought_trace_hook(
+                        runtime.lens_model.layers,
+                        layer=int(artifact["thought_probe"]["layer"]),
+                        probe_vector=artifact["thought_probe"]["vector_b_minus_a"],
+                        user_positions=prompt.user_positions,
+                        max_response_tokens=int(config.sweep["thought_trace_tokens"]),
+                    )
+                )
+                selected_positions: tuple[int, ...] = ()
+                if spec.method != "baseline":
+                    selected_positions = matched_prompt_positions(
+                        str(spec.position_policy),
+                        user_positions=prompt.user_positions,
+                        system_positions=prompt.system_positions,
+                    )
+                    if spec.method == "jlens_swap":
+                        stack.enter_context(
+                            intervention_band_hooks(
+                                runtime.lens_model.layers,
+                                layer_operators=_swap_operators(spec, artifact),
+                                prompt_positions=selected_positions,
+                            )
+                        )
+                    else:
+                        stack.enter_context(
+                            intervention_hook(
+                                runtime.lens_model.layers,
+                                layer=int(spec.applied_layer),
+                                prompt_positions=selected_positions,
+                                operator=_operator_for(spec, artifact),
+                            )
+                        )
                 generation = generate_text(
                     runtime,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
+                    input_ids=prompt.input_ids,
+                    attention_mask=prompt.attention_mask,
                     generation_config=config.generation,
                 )
-            else:
-                operator = _operator_for(spec, artifact)
-                with intervention_hook(
-                    runtime.lens_model.layers,
-                    layer=int(spec.applied_layer),
-                    position_policy=str(spec.position_policy),
-                    operator=operator,
-                ):
-                    generation = generate_text(
-                        runtime,
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        generation_config=config.generation,
-                    )
+                thought_trace = finalize_thought_trace(trace)
             elapsed = time.perf_counter() - started
             behavior = classify_behavior(
                 generation.text,
@@ -381,6 +437,9 @@ def run_sweep(
                 "run_fingerprint": config.run_fingerprint,
                 **asdict(spec),
                 "prompt_token_sha256": prompt_hash,
+                "prompt_tokens": int(prompt.input_ids.shape[1]),
+                "user_span_tokens": len(prompt.user_positions),
+                "intervened_prompt_tokens": len(selected_positions),
                 "completion_token_ids": generation.completion_ids,
                 "completion_tokens": len(generation.completion_ids),
                 "terminated_by_eos": generation.terminated_by_eos,
@@ -390,6 +449,7 @@ def run_sweep(
                 "output_text": generation.text,
                 "elapsed_seconds": elapsed,
                 "behavior": behavior,
+                "thought_trace": thought_trace,
             }
             sink.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
             sink.flush()

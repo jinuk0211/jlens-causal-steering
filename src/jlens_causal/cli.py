@@ -48,6 +48,7 @@ def _validate_data(config: PilotConfig) -> dict[str, Any]:
         "toolalign_root": str(config.toolalign_root),
         "output_dir": str(config.output_dir),
         "selected_cases": selections,
+        "calibration_pairs": selections["calibration"] // 2,
         "estimated_generations": config.estimated_generations(),
         "direction_fingerprint": config.direction_fingerprint,
         "run_fingerprint": config.run_fingerprint,
