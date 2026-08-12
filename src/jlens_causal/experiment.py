@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from jlens_causal.config import PilotConfig
 from jlens_causal.directions import load_directions
@@ -18,6 +18,16 @@ from jlens_causal.interventions import (
 )
 from jlens_causal.modeling import ModelRuntime, generate_text, render_messages, token_ids_sha256
 from jlens_causal.toolalign import ScenarioCase, classify_behavior, load_cases, messages_for_case
+
+RECORD_SCHEMA_VERSION = "jlens-causal-record-v2"
+MANIFEST_SCHEMA_VERSION = "jlens-causal-run-v2"
+GENERATED_ARTIFACTS = (
+    "directions.pt",
+    "manifest.json",
+    "runs.jsonl",
+    "trial_metrics.csv",
+    "summary.csv",
+)
 
 
 @dataclass(frozen=True)
@@ -40,6 +50,49 @@ class TrialSpec:
 def _stable_hash(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def trial_run_id(config: PilotConfig, spec: TrialSpec) -> str:
+    return _stable_hash({"run_fingerprint": config.run_fingerprint, **asdict(spec)})
+
+
+def reset_output_artifacts(config: PilotConfig) -> list[str]:
+    """Remove only files owned by this runner, never arbitrary directory contents."""
+    targets = []
+    for name in GENERATED_ARTIFACTS:
+        path = config.output_dir / name
+        if not path.exists():
+            continue
+        if not path.is_file() and not path.is_symlink():
+            raise ValueError(f"refusing to remove non-file generated artifact: {path}")
+        targets.append(path)
+    removed: list[str] = []
+    for path in targets:
+        path.unlink()
+        removed.append(str(path))
+    return removed
+
+
+def validate_output_compatibility(config: PilotConfig) -> None:
+    """Reject stale v1 or semantically different outputs before model loading."""
+    manifest_path = config.output_dir / "manifest.json"
+    records_exist = config.records_path.is_file()
+    if not manifest_path.is_file():
+        if records_exist:
+            raise ValueError(
+                f"{config.records_path} exists without a manifest; rerun with "
+                f"`jlens-causal all {config.path} --fresh`"
+            )
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        or manifest.get("run_fingerprint") != config.run_fingerprint
+    ):
+        raise ValueError(
+            f"output directory contains results from an incompatible configuration: "
+            f"{config.output_dir}; rerun with `jlens-causal all {config.path} --fresh`"
+        )
 
 
 def _method_variants(config: PilotConfig, methods: list[str]) -> Iterator[tuple[str, int | None]]:
@@ -171,7 +224,8 @@ def _case_map(cases: list[ScenarioCase]) -> dict[tuple[str, int, str], ScenarioC
     return {(case.domain, case.document, case.scenario_type): case for case in cases}
 
 
-def _completed_ids(path: Path) -> set[str]:
+def _completed_ids(config: PilotConfig) -> set[str]:
+    path = config.records_path
     if not path.is_file():
         return set()
     completed: set[str] = set()
@@ -183,6 +237,21 @@ def _completed_ids(path: Path) -> set[str]:
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"invalid JSONL at {path}:{line_number}") from exc
+            if record.get("schema_version") != RECORD_SCHEMA_VERSION:
+                raise ValueError(
+                    f"stale record schema at {path}:{line_number}; rerun with "
+                    f"`jlens-causal all {config.path} --fresh`"
+                )
+            if record.get("run_fingerprint") != config.run_fingerprint:
+                raise ValueError(
+                    f"record fingerprint mismatch at {path}:{line_number}; rerun with "
+                    f"`jlens-causal all {config.path} --fresh`"
+                )
+            if record.get("method") == "baseline" and not record.get("valid_for_pairing", False):
+                raise ValueError(
+                    f"invalid alpha=0 baseline at {path}:{line_number}; rerun with "
+                    f"`jlens-causal all {config.path} --fresh`"
+                )
             run_id = record.get("run_id")
             if isinstance(run_id, str):
                 completed.add(run_id)
@@ -211,8 +280,9 @@ def _operator_for(spec: TrialSpec, artifact: dict[str, Any]) -> Any:
 
 def _record_manifest(config: PilotConfig, planned: int) -> None:
     manifest = {
-        "schema_version": "jlens-causal-run-v1",
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "direction_fingerprint": config.direction_fingerprint,
+        "run_fingerprint": config.run_fingerprint,
         "planned_generations": planned,
         "estimated_breakdown": config.estimated_generations(),
         "config": config.public_dict(),
@@ -232,6 +302,7 @@ def run_sweep(
     """Run missing trials, appending one durable JSON record per generation."""
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
+    validate_output_compatibility(config)
     artifact = load_directions(config, runtime.torch)
     all_specs = list(iter_trial_specs(config))
     expected = config.estimated_generations()["total"]
@@ -250,15 +321,14 @@ def run_sweep(
         scenario_types=[config.data["scenario_a"], config.data["scenario_b"]],
     )
     cases_by_key = _case_map(cases)
+    completed = _completed_ids(config)
     _record_manifest(config, len(all_specs))
-    completed = _completed_ids(config.records_path)
     stats = {"planned": len(all_specs), "already_complete": 0, "written": 0}
     prompt_cache: dict[tuple[str, int, str, str], tuple[Any, Any, str]] = {}
 
     with config.records_path.open("a", encoding="utf-8", buffering=1) as sink:
         for spec in all_specs:
-            identity = {"direction_fingerprint": config.direction_fingerprint, **asdict(spec)}
-            run_id = _stable_hash(identity)
+            run_id = trial_run_id(config, spec)
             if run_id in completed:
                 stats["already_complete"] += 1
                 continue
@@ -277,7 +347,7 @@ def run_sweep(
 
             started = time.perf_counter()
             if spec.method == "baseline":
-                output_text, completion_ids = generate_text(
+                generation = generate_text(
                     runtime,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -291,26 +361,44 @@ def run_sweep(
                     position_policy=str(spec.position_policy),
                     operator=operator,
                 ):
-                    output_text, completion_ids = generate_text(
+                    generation = generate_text(
                         runtime,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         generation_config=config.generation,
                     )
             elapsed = time.perf_counter() - started
+            behavior = classify_behavior(
+                generation.text,
+                case.tools,
+                truncated=generation.hit_token_limit,
+            )
+            valid_for_pairing = bool(behavior["valid_for_pairing"])
             record = {
-                "schema_version": "jlens-causal-record-v1",
+                "schema_version": RECORD_SCHEMA_VERSION,
                 "run_id": run_id,
                 "direction_fingerprint": config.direction_fingerprint,
+                "run_fingerprint": config.run_fingerprint,
                 **asdict(spec),
                 "prompt_token_sha256": prompt_hash,
-                "completion_token_ids": completion_ids,
-                "output_text": output_text,
+                "completion_token_ids": generation.completion_ids,
+                "completion_tokens": len(generation.completion_ids),
+                "terminated_by_eos": generation.terminated_by_eos,
+                "truncated": generation.hit_token_limit,
+                "termination_reason": generation.termination_reason,
+                "valid_for_pairing": valid_for_pairing,
+                "output_text": generation.text,
                 "elapsed_seconds": elapsed,
-                "behavior": classify_behavior(output_text, case.tools),
+                "behavior": behavior,
             }
             sink.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
             sink.flush()
             completed.add(run_id)
             stats["written"] += 1
+            if spec.method == "baseline" and not valid_for_pairing:
+                raise RuntimeError(
+                    "alpha=0 baseline is truncated or unparsable; the raw record was saved, "
+                    f"and the sweep stopped before treatments. Rerun with "
+                    f"`jlens-causal all {config.path} --fresh` after fixing generation."
+                )
     return stats

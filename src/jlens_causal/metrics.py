@@ -7,14 +7,20 @@ import json
 import math
 import random
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
 from statistics import mean
-from typing import Any, Iterable
+from typing import Any
 
 from jlens_causal.config import PilotConfig
+from jlens_causal.experiment import RECORD_SCHEMA_VERSION
 
 
-def load_records(path: Path) -> list[dict[str, Any]]:
+def load_records(
+    path: Path,
+    *,
+    expected_run_fingerprint: str | None = None,
+) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"missing run records: {path}")
     records: list[dict[str, Any]] = []
@@ -27,8 +33,19 @@ def load_records(path: Path) -> list[dict[str, Any]]:
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"invalid JSONL at {path}:{line_number}") from exc
-            if record.get("schema_version") != "jlens-causal-record-v1":
-                raise ValueError(f"unsupported record schema at {path}:{line_number}")
+            if record.get("schema_version") != RECORD_SCHEMA_VERSION:
+                raise ValueError(
+                    f"unsupported or stale record schema at {path}:{line_number}; "
+                    "rerun the experiment with --fresh"
+                )
+            if (
+                expected_run_fingerprint is not None
+                and record.get("run_fingerprint") != expected_run_fingerprint
+            ):
+                raise ValueError(
+                    f"run fingerprint mismatch at {path}:{line_number}; "
+                    "rerun the experiment with --fresh"
+                )
             run_id = record.get("run_id")
             if run_id in seen:
                 raise ValueError(f"duplicate run_id {run_id!r} at {path}:{line_number}")
@@ -79,10 +96,18 @@ def paired_trial_metrics(
 ) -> list[dict[str, Any]]:
     """Pair each treatment with source/target alpha=0 and matched random trials."""
     baselines = {
-        _baseline_key(record): record
-        for record in records
-        if record["method"] == "baseline"
+        _baseline_key(record): record for record in records if record["method"] == "baseline"
     }
+    invalid_baselines = [
+        record["run_id"]
+        for record in baselines.values()
+        if not record.get("valid_for_pairing", False)
+    ]
+    if invalid_baselines:
+        raise ValueError(
+            "alpha=0 baselines are truncated or unparsable and cannot be analyzed: "
+            + ", ".join(invalid_baselines)
+        )
     treatments = [record for record in records if record["method"] != "baseline"]
     rows: list[dict[str, Any]] = []
     a = config.data["scenario_a"]
@@ -96,13 +121,18 @@ def paired_trial_metrics(
                 "every treatment requires both source and counterpart alpha=0 baselines"
             ) from exc
         source_class_target = _same_class(source, target)
-        treatment_class_target = _same_class(treatment, target)
+        treatment_valid = bool(treatment.get("valid_for_pairing", False))
+        treatment_class_target = _same_class(treatment, target) if treatment_valid else 0
         source_signature_target = _same_signature(source, target)
-        treatment_signature_target = _same_signature(treatment, target)
+        treatment_signature_target = _same_signature(treatment, target) if treatment_valid else 0
         source_aligned = _binary_behavior(source, "behavior_class", "aligned")
-        treatment_aligned = _binary_behavior(treatment, "behavior_class", "aligned")
+        treatment_aligned = (
+            _binary_behavior(treatment, "behavior_class", "aligned") if treatment_valid else 0
+        )
         source_parse_error = int(bool(source["behavior"].get("parse_error")))
         treatment_parse_error = int(bool(treatment["behavior"].get("parse_error")))
+        source_truncated = int(bool(source.get("truncated")))
+        treatment_truncated = int(bool(treatment.get("truncated")))
         source_no_tool = _binary_behavior(source, "behavior_class", "no_tool")
         treatment_no_tool = _binary_behavior(treatment, "behavior_class", "no_tool")
         rows.append(
@@ -126,12 +156,16 @@ def paired_trial_metrics(
                 "target_class_effect": treatment_class_target - source_class_target,
                 "baseline_target_signature_success": source_signature_target,
                 "steer_target_signature_success": treatment_signature_target,
-                "target_signature_effect": treatment_signature_target
-                - source_signature_target,
-                "source_class_retained": _same_class(treatment, source),
-                "source_signature_retained": _same_signature(treatment, source),
+                "target_signature_effect": treatment_signature_target - source_signature_target,
+                "source_class_retained": _same_class(treatment, source) if treatment_valid else 0,
+                "source_signature_retained": _same_signature(treatment, source)
+                if treatment_valid
+                else 0,
                 "output_text_changed": int(treatment["output_text"] != source["output_text"]),
                 "parse_error_increase": treatment_parse_error - source_parse_error,
+                "truncated_increase": treatment_truncated - source_truncated,
+                "invalid_output": int(not treatment_valid),
+                "corruption_increase": int(not treatment_valid),
                 "no_tool_increase": treatment_no_tool - source_no_tool,
                 "safe_aligned_baseline": source_aligned
                 if treatment["source_scenario"] == a
@@ -174,9 +208,7 @@ def paired_trial_metrics(
         row["random_target_class_effect_mean"] = random_class
         row["random_target_signature_effect_mean"] = random_signature
         row["causal_delta_class_vs_random"] = row["target_class_effect"] - random_class
-        row["causal_delta_signature_vs_random"] = (
-            row["target_signature_effect"] - random_signature
-        )
+        row["causal_delta_signature_vs_random"] = row["target_signature_effect"] - random_signature
     return rows
 
 
@@ -238,6 +270,9 @@ SUMMARY_METRICS = (
     "source_signature_retained",
     "output_text_changed",
     "parse_error_increase",
+    "truncated_increase",
+    "invalid_output",
+    "corruption_increase",
     "no_tool_increase",
     "safe_degradation",
 )
@@ -289,7 +324,10 @@ def analyze_runs(
     *,
     bootstrap_samples: int = 2_000,
 ) -> dict[str, Any]:
-    records = load_records(config.records_path)
+    records = load_records(
+        config.records_path,
+        expected_run_fingerprint=config.run_fingerprint,
+    )
     rows = paired_trial_metrics(config, records)
     summaries = summarize_rows(
         rows,

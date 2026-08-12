@@ -19,6 +19,15 @@ class ModelRuntime:
     device: Any
 
 
+@dataclass(frozen=True)
+class GenerationResult:
+    text: str
+    completion_ids: list[int]
+    terminated_by_eos: bool
+    hit_token_limit: bool
+    termination_reason: str
+
+
 def _resolve_dtype(torch: Any, value: str) -> Any:
     if value == "auto":
         return "auto"
@@ -35,7 +44,9 @@ def load_runtime(model_config: dict[str, Any]) -> ModelRuntime:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     requested_device = str(model_config.get("device", "auto"))
-    device = "cuda" if requested_device == "auto" and torch.cuda.is_available() else requested_device
+    device = (
+        "cuda" if requested_device == "auto" and torch.cuda.is_available() else requested_device
+    )
     if device == "auto":
         device = "cpu"
     dtype = _resolve_dtype(torch, str(model_config.get("dtype", "auto")))
@@ -108,6 +119,40 @@ def token_ids_sha256(input_ids: Any) -> str:
     return hashlib.sha256(",".join(map(str, values)).encode()).hexdigest()
 
 
+def completion_status(
+    completion_ids: list[int],
+    *,
+    max_new_tokens: int,
+    eos_token_ids: set[int],
+) -> tuple[bool, bool, str]:
+    """Classify termination without trusting backend-specific finish strings."""
+    terminated_by_eos = bool(completion_ids and completion_ids[-1] in eos_token_ids)
+    hit_token_limit = len(completion_ids) >= max_new_tokens and not terminated_by_eos
+    if terminated_by_eos:
+        reason = "eos"
+    elif hit_token_limit:
+        reason = "length"
+    else:
+        reason = "other_stop"
+    return terminated_by_eos, hit_token_limit, reason
+
+
+def _eos_token_ids(runtime: ModelRuntime) -> set[int]:
+    values: set[int] = set()
+    candidates = (
+        getattr(runtime.tokenizer, "eos_token_id", None),
+        getattr(getattr(runtime.hf_model, "generation_config", None), "eos_token_id", None),
+    )
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if isinstance(candidate, (list, tuple, set)):
+            values.update(int(value) for value in candidate)
+        else:
+            values.add(int(candidate))
+    return values
+
+
 @contextmanager
 def capture_block_outputs(blocks: Any, layers: Iterable[int]):
     """Capture block outputs without modifying them."""
@@ -135,7 +180,7 @@ def generate_text(
     input_ids: Any,
     attention_mask: Any,
     generation_config: dict[str, Any],
-) -> tuple[str, list[int]]:
+) -> GenerationResult:
     """Generate deterministically under the caller's active intervention hooks."""
     torch = runtime.torch
     seed = int(generation_config["seed"])
@@ -165,4 +210,15 @@ def generate_text(
         skip_special_tokens=False,
         clean_up_tokenization_spaces=False,
     )
-    return text, completion
+    terminated_by_eos, hit_token_limit, termination_reason = completion_status(
+        completion,
+        max_new_tokens=int(generation_config["max_new_tokens"]),
+        eos_token_ids=_eos_token_ids(runtime),
+    )
+    return GenerationResult(
+        text=text,
+        completion_ids=completion,
+        terminated_by_eos=terminated_by_eos,
+        hit_token_limit=hit_token_limit,
+        termination_reason=termination_reason,
+    )

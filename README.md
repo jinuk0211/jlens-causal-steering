@@ -84,7 +84,7 @@ jlens-causal plan configs/qwen35_toolalign_pilot.json
 Run a small end-to-end smoke test:
 
 ```bash
-jlens-causal all configs/smoke.json
+jlens-causal all configs/smoke.json --fresh
 ```
 
 Run the full pilot in explicit phases:
@@ -96,8 +96,16 @@ jlens-causal analyze configs/qwen35_toolalign_pilot.json
 ```
 
 `run` appends one flushed JSON object after every generation. Re-running it
-skips completed deterministic `run_id` values. `--limit N` is useful for a
-GPU-side smoke run and does not discard previous results.
+skips completed deterministic `run_id` values. The ID includes the full
+generation configuration, so results made with a different token limit cannot
+be reused silently. `--fresh` removes only this runner's known artifacts before
+an `all` run; `--limit N` bounds new generations without discarding compatible
+results.
+
+Both checked-in configs use ToolAlignBench inference's deterministic default
+limit of `max_new_tokens=4096`. A completion that reaches this limit without an
+EOS is recorded as truncated. An invalid alpha-zero baseline stops the sweep
+before any causal comparison is made.
 
 ## Outputs
 
@@ -105,7 +113,7 @@ Each config has its own `output_dir`:
 
 - `directions.pt`: tensor-only direction artifact with a config fingerprint;
 - `manifest.json`: resolved config and planned generation counts;
-- `runs.jsonl`: raw generation, treatment metadata, and parsed behavior;
+- `runs.jsonl`: raw generation, termination metadata, treatment, and behavior;
 - `trial_metrics.csv`: treatment paired with source/target alpha-zero baselines;
 - `summary.csv`: grouped means and domain/document cluster-bootstrap intervals.
 
@@ -120,9 +128,9 @@ causal_delta = effect_steer - effect_random
 ```
 
 `safe_degradation` is the loss of the `aligned` indicator relative to the
-same safe prompt's alpha-zero output. Parse-error and no-tool increases are
-reported separately so output corruption is visible rather than counted as a
-successful transition.
+same safe prompt's alpha-zero output. Parse errors, truncation, and the combined
+`invalid_output`/`corruption_increase` fields are reported separately and always
+receive zero target-success credit.
 
 ## Vast.ai
 
@@ -139,7 +147,8 @@ cd /workspace
 curl -fsSL https://raw.githubusercontent.com/jinuk0211/jlens-causal-steering/main/scripts/vast_setup.sh | bash -s -- setup
 ```
 
-Run the 18-generation smoke grid immediately after setup:
+Run a fresh 18-generation smoke grid immediately after setup. This intentionally
+replaces any earlier smoke artifacts, including the obsolete 64-token run:
 
 ```bash
 cd /workspace

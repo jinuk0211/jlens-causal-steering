@@ -8,7 +8,11 @@ from typing import Any
 
 from jlens_causal.config import PilotConfig, load_config
 from jlens_causal.directions import extract_directions
-from jlens_causal.experiment import run_sweep
+from jlens_causal.experiment import (
+    reset_output_artifacts,
+    run_sweep,
+    validate_output_compatibility,
+)
 from jlens_causal.metrics import analyze_runs
 from jlens_causal.modeling import load_runtime
 from jlens_causal.toolalign import load_cases
@@ -46,6 +50,7 @@ def _validate_data(config: PilotConfig) -> dict[str, Any]:
         "selected_cases": selections,
         "estimated_generations": config.estimated_generations(),
         "direction_fingerprint": config.direction_fingerprint,
+        "run_fingerprint": config.run_fingerprint,
     }
 
 
@@ -75,6 +80,11 @@ def _parser() -> argparse.ArgumentParser:
     all_command = subparsers.add_parser("all")
     all_command.add_argument("config")
     all_command.add_argument("--force-directions", action="store_true")
+    all_command.add_argument(
+        "--fresh",
+        action="store_true",
+        help="remove this runner's known artifacts before starting",
+    )
     all_command.add_argument("--limit", type=int)
     all_command.add_argument("--bootstrap-samples", type=int, default=2_000)
     return parser
@@ -90,6 +100,12 @@ def main(argv: list[str] | None = None) -> int:
         _print(analyze_runs(config, bootstrap_samples=args.bootstrap_samples))
         return 0
 
+    fresh_removed: list[str] = []
+    if args.command == "all" and args.fresh:
+        fresh_removed = reset_output_artifacts(config)
+    elif args.command in {"run", "all"}:
+        validate_output_compatibility(config)
+
     runtime = load_runtime(config.model)
     if args.command == "extract-directions":
         path = extract_directions(config, runtime, force=args.force)
@@ -99,18 +115,22 @@ def main(argv: list[str] | None = None) -> int:
         _print(run_sweep(config, runtime, limit=args.limit))
         return 0
     if args.command == "all":
-        path = extract_directions(config, runtime, force=args.force_directions)
+        path = extract_directions(
+            config,
+            runtime,
+            force=args.force_directions or args.fresh,
+        )
         run_stats = run_sweep(config, runtime, limit=args.limit)
         result: dict[str, Any] = {
             "direction_artifact": str(path),
+            "fresh_removed": fresh_removed,
             "run": run_stats,
         }
-        if args.limit is None and run_stats["already_complete"] + run_stats["written"] == run_stats[
-            "planned"
-        ]:
-            result["analysis"] = analyze_runs(
-                config, bootstrap_samples=args.bootstrap_samples
-            )
+        if (
+            args.limit is None
+            and run_stats["already_complete"] + run_stats["written"] == run_stats["planned"]
+        ):
+            result["analysis"] = analyze_runs(config, bootstrap_samples=args.bootstrap_samples)
         else:
             result["analysis"] = "skipped because the sweep is incomplete"
         _print(result)

@@ -47,7 +47,7 @@ if [[ ! -x .venv/bin/python ]]; then
 fi
 
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade pip wheel "setuptools>=77,<81"
 python -m pip install -e ".[dev]"
 
 export HF_HOME="${HF_HOME:-${VAST_ROOT}/.cache/huggingface}"
@@ -66,7 +66,7 @@ PY
 jlens-causal validate configs/smoke.json
 
 if [[ "${MODE}" == "smoke" ]]; then
-  jlens-causal all configs/smoke.json
+  jlens-causal all configs/smoke.json --fresh
 elif [[ "${MODE}" == "full" ]]; then
   jlens-causal all configs/qwen35_toolalign_pilot.json
 else

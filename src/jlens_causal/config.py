@@ -85,6 +85,29 @@ class PilotConfig:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
 
+    @property
+    def run_fingerprint(self) -> str:
+        """Hash every semantic input that can change a generation result."""
+        payload = {
+            "direction_fingerprint": self.direction_fingerprint,
+            "model": self.model,
+            "evaluation": {
+                key: self.data[key]
+                for key in (
+                    "scenario_a",
+                    "scenario_b",
+                    "evaluation_domains",
+                    "evaluation_documents",
+                    "conditions",
+                )
+            },
+            "directions": self.directions,
+            "sweep": self.sweep,
+            "generation": self.generation,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
     def estimated_generations(self) -> dict[str, int]:
         """Return exact planned generation counts before resume de-duplication."""
         pairs = (
@@ -105,11 +128,7 @@ class PilotConfig:
         )
         counts = {
             "baseline": pairs * 2,
-            "main_additive": pairs
-            * directions
-            * layers
-            * len(nonzero_alphas)
-            * variants,
+            "main_additive": pairs * directions * layers * len(nonzero_alphas) * variants,
             "site_controls": pairs
             * directions
             * layers
@@ -120,11 +139,7 @@ class PilotConfig:
         }
         if self.sweep["include_paper_coordinate_swap"]:
             counts["paper_swap"] = (
-                pairs
-                * directions
-                * layers
-                * len(self.sweep["coordinate_swap_alphas"])
-                * 3
+                pairs * directions * layers * len(self.sweep["coordinate_swap_alphas"]) * 3
             )
         counts["total"] = sum(counts.values())
         return counts
