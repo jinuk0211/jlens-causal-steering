@@ -14,7 +14,7 @@ from jlens_causal.config import PilotConfig
 from jlens_causal.modeling import ModelRuntime, capture_block_outputs, render_messages
 from jlens_causal.toolalign import ScenarioCase, load_cases, messages_for_case
 
-DIRECTION_SCHEMA_VERSION = "jlens-direction-artifact-v2"
+DIRECTION_SCHEMA_VERSION = "jlens-direction-artifact-v3"
 
 _STOPWORDS = {
     "about",
@@ -75,10 +75,15 @@ _STOPWORDS = {
     "itself",
     "just",
     "me",
+    "may",
     "more",
     "most",
+    "might",
+    "must",
     "my",
     "myself",
+    "need",
+    "needs",
     "no",
     "nor",
     "not",
@@ -180,6 +185,46 @@ def _eligible_token(text: str, excluded: set[str]) -> bool:
     return bool(re.fullmatch(r"[a-zA-Z][a-zA-Z-]{2,}", token)) and token not in excluded
 
 
+def scenario_lexicons(
+    cases: list[ScenarioCase],
+    *,
+    scenario_a: str,
+    scenario_b: str,
+    min_domains: int,
+    excluded: set[str],
+) -> tuple[dict[str, set[str]], dict[str, dict[str, int]]]:
+    """Derive scenario-enriched whole-word vocabularies from calibration only."""
+    by_scenario: dict[str, dict[str, set[str]]] = {
+        scenario_a: defaultdict(set),
+        scenario_b: defaultdict(set),
+    }
+    for case in cases:
+        if case.scenario_type not in by_scenario:
+            continue
+        words = {
+            _normalized_token(word)
+            for word in re.findall(r"[A-Za-z][A-Za-z-]{2,}", case.prompt)
+        }
+        for word in words:
+            if word and word not in excluded:
+                by_scenario[case.scenario_type][word].add(case.domain)
+
+    counts: dict[str, dict[str, int]] = {}
+    for word in set(by_scenario[scenario_a]) | set(by_scenario[scenario_b]):
+        counts[word] = {
+            scenario_a: len(by_scenario[scenario_a].get(word, set())),
+            scenario_b: len(by_scenario[scenario_b].get(word, set())),
+        }
+    lexicons: dict[str, set[str]] = {scenario_a: set(), scenario_b: set()}
+    for scenario, other in ((scenario_a, scenario_b), (scenario_b, scenario_a)):
+        lexicons[scenario] = {
+            word
+            for word, row in counts.items()
+            if row[scenario] >= int(min_domains) and row[scenario] > row[other]
+        }
+    return lexicons, counts
+
+
 def select_stable_targets(
     domain_deltas: np.ndarray,
     token_texts: list[str],
@@ -188,9 +233,14 @@ def select_stable_targets(
     top_k: int,
     min_domain_consistency: int,
     candidate_per_fold: int,
+    min_loo_frequency: int,
     excluded: set[str],
+    target_lexicons: dict[str, set[str]] | None = None,
+    lexical_domain_counts: dict[str, dict[str, int]] | None = None,
+    scenario_a: str = "a",
+    scenario_b: str = "b",
 ) -> dict[str, Any]:
-    """Select sparse positive/negative readout targets without evaluation leakage."""
+    """Select effect-ranked, lexically anchored targets without evaluation leakage."""
     values = np.asarray(domain_deltas, dtype=np.float64)
     if values.ndim != 2 or values.shape[1] != len(token_texts):
         raise ValueError("domain_deltas must be [domains, vocabulary]")
@@ -198,37 +248,61 @@ def select_stable_targets(
         raise ValueError("domain_names do not match domain_deltas")
     if min_domain_consistency > values.shape[0]:
         raise ValueError("min_domain_consistency exceeds the calibration domain count")
-    eligible = np.asarray([_eligible_token(text, excluded) for text in token_texts])
+    if min_loo_frequency > values.shape[0]:
+        raise ValueError("min_loo_frequency exceeds the calibration domain count")
+    base_eligible = np.asarray([_eligible_token(text, excluded) for text in token_texts])
+    normalized_tokens = [_normalized_token(text) for text in token_texts]
+    if target_lexicons is None:
+        target_lexicons = {
+            scenario_a: set(normalized_tokens),
+            scenario_b: set(normalized_tokens),
+        }
+    missing_lexicons = {scenario_a, scenario_b} - set(target_lexicons)
+    if missing_lexicons:
+        raise ValueError(f"target lexicons are missing scenarios {sorted(missing_lexicons)}")
+    eligible_by_target = {
+        scenario: base_eligible
+        & np.asarray([token in target_lexicons[scenario] for token in normalized_tokens])
+        for scenario in (scenario_a, scenario_b)
+    }
     mean_delta = values.mean(axis=0)
     std_delta = values.std(axis=0, ddof=1) if values.shape[0] > 1 else np.ones(values.shape[1])
     standardized = mean_delta / np.maximum(std_delta, 1e-6)
     positive_consistency = (values > 0).sum(axis=0)
     negative_consistency = (values < 0).sum(axis=0)
 
-    positive_frequency = np.zeros(values.shape[1], dtype=np.int64)
-    negative_frequency = np.zeros(values.shape[1], dtype=np.int64)
-    eligible_ids = np.flatnonzero(eligible)
-    fold_width = min(int(candidate_per_fold), len(eligible_ids))
-    for held_out in range(values.shape[0]):
-        fold = np.delete(values, held_out, axis=0).mean(axis=0)
-        pos = eligible_ids[np.argsort(fold[eligible_ids])[-fold_width:]]
-        neg = eligible_ids[np.argsort(fold[eligible_ids])[:fold_width]]
-        positive_frequency[pos] += 1
-        negative_frequency[neg] += 1
+    loo_frequency = {
+        scenario_a: np.zeros(values.shape[1], dtype=np.int64),
+        scenario_b: np.zeros(values.shape[1], dtype=np.int64),
+    }
+    for scenario, sign in ((scenario_a, -1.0), (scenario_b, 1.0)):
+        eligible_ids = np.flatnonzero(eligible_by_target[scenario])
+        fold_width = min(int(candidate_per_fold), len(eligible_ids))
+        for held_out in range(values.shape[0]):
+            fold = sign * np.delete(values, held_out, axis=0).mean(axis=0)
+            top = eligible_ids[np.argsort(fold[eligible_ids])[-fold_width:]]
+            loo_frequency[scenario][top] += 1
 
-    def choose(kind: str) -> list[dict[str, Any]]:
-        if kind == "b":
-            mask = eligible & (positive_consistency >= min_domain_consistency)
-            score = standardized * (1.0 + positive_frequency / values.shape[0])
+    def choose(scenario: str) -> list[dict[str, Any]]:
+        if scenario == scenario_b:
+            mask = eligible_by_target[scenario] & (
+                positive_consistency >= min_domain_consistency
+            )
+            signed_effect = mean_delta
             consistency = positive_consistency
-            frequency = positive_frequency
-            order = np.argsort(score)[::-1]
+            kind = "b"
         else:
-            mask = eligible & (negative_consistency >= min_domain_consistency)
-            score = -standardized * (1.0 + negative_frequency / values.shape[0])
+            mask = eligible_by_target[scenario] & (
+                negative_consistency >= min_domain_consistency
+            )
+            signed_effect = -mean_delta
             consistency = negative_consistency
-            frequency = negative_frequency
-            order = np.argsort(score)[::-1]
+            kind = "a"
+        frequency = loo_frequency[scenario]
+        mask &= frequency >= int(min_loo_frequency)
+        mask &= signed_effect > 0
+        score = signed_effect * (frequency / values.shape[0])
+        order = np.argsort(score)[::-1]
         selected_ids: list[int] = []
         selected_tokens: set[str] = set()
         for index in order:
@@ -246,32 +320,44 @@ def select_stable_targets(
                 f"only {len(selected_ids)} stable concept tokens for target {kind}; "
                 "relax the preregistered selection threshold explicitly"
             )
-        raw_weights = np.asarray([abs(standardized[index]) for index in selected_ids])
+        raw_weights = np.asarray([abs(mean_delta[index]) for index in selected_ids])
         if not np.isfinite(raw_weights).all() or float(raw_weights.sum()) == 0.0:
             raw_weights = np.ones(len(selected_ids), dtype=np.float64)
         weights = raw_weights / raw_weights.sum()
-        return [
-            {
+        rows: list[dict[str, Any]] = []
+        for index, weight in zip(selected_ids, weights, strict=True):
+            token = normalized_tokens[index]
+            row = {
                 "token_id": index,
-                "token": _normalized_token(token_texts[index]),
+                "token": token,
                 "mean_delta_b_minus_a": float(mean_delta[index]),
                 "standardized_effect": float(standardized[index]),
                 "domain_consistency": int(consistency[index]),
                 "loo_top_frequency": int(frequency[index]),
                 "weight": float(weight),
             }
-            for index, weight in zip(selected_ids, weights, strict=True)
-        ]
+            if lexical_domain_counts is not None:
+                lexical_counts = lexical_domain_counts.get(token, {})
+                row["lexical_domains_target"] = int(lexical_counts.get(scenario, 0))
+                other = scenario_a if scenario == scenario_b else scenario_b
+                row["lexical_domains_other"] = int(lexical_counts.get(other, 0))
+            rows.append(row)
+        return rows
 
     return {
         "calibration_domains": domain_names,
         "vocabulary_size": len(token_texts),
-        "eligible_vocabulary_size": int(eligible.sum()),
+        "eligible_vocabulary_size": int(base_eligible.sum()),
+        "eligible_target_a_size": int(eligible_by_target[scenario_a].sum()),
+        "eligible_target_b_size": int(eligible_by_target[scenario_b].sum()),
         "top_k": int(top_k),
         "min_domain_consistency": int(min_domain_consistency),
         "candidate_per_fold": int(candidate_per_fold),
-        "target_a": choose("a"),
-        "target_b": choose("b"),
+        "min_loo_frequency": int(min_loo_frequency),
+        "ranking": "cross_domain_mean_effect_x_loo_frequency",
+        "weighting": "absolute_cross_domain_mean_effect",
+        "target_a": choose(scenario_a),
+        "target_b": choose(scenario_b),
     }
 
 
@@ -417,6 +503,16 @@ def extract_directions(
         str(value) for value in runtime.tokenizer.convert_ids_to_tokens(range(vocab_size))
     ]
     selection_config = config.directions["target_selection"]
+    excluded = _excluded_terms(cases, runtime.tokenizer)
+    a = config.data["scenario_a"]
+    b = config.data["scenario_b"]
+    lexicons, lexical_domain_counts = scenario_lexicons(
+        cases,
+        scenario_a=a,
+        scenario_b=b,
+        min_domains=int(selection_config["min_lexical_domains"]),
+        excluded=excluded,
+    )
     selection = select_stable_targets(
         domain_scores,
         token_texts,
@@ -424,15 +520,23 @@ def extract_directions(
         top_k=int(selection_config["top_k"]),
         min_domain_consistency=int(selection_config["min_domain_consistency"]),
         candidate_per_fold=int(selection_config["candidate_per_fold"]),
-        excluded=_excluded_terms(cases, runtime.tokenizer),
+        min_loo_frequency=int(selection_config["min_loo_frequency"]),
+        excluded=excluded,
+        target_lexicons=lexicons,
+        lexical_domain_counts=lexical_domain_counts,
+        scenario_a=a,
+        scenario_b=b,
     )
     selection.update(
         {
-            "schema_version": "jlens-target-selection-v1",
-            "scenario_a": config.data["scenario_a"],
-            "scenario_b": config.data["scenario_b"],
+            "schema_version": "jlens-target-selection-v2",
+            "scenario_a": a,
+            "scenario_b": b,
             "readout_layer": int(selection_config["readout_layer"]),
             "calibration_pairs": len(samples[int(selection_config["readout_layer"])]),
+            "min_lexical_domains": int(selection_config["min_lexical_domains"]),
+            "target_a_lexicon_size": len(lexicons[a]),
+            "target_b_lexicon_size": len(lexicons[b]),
         }
     )
 
@@ -440,8 +544,6 @@ def extract_directions(
     embedding = runtime.hf_model.get_output_embeddings().weight
     u_a = _weighted_target(embedding, selection["target_a"])
     u_b = _weighted_target(embedding, selection["target_b"])
-    a = config.data["scenario_a"]
-    b = config.data["scenario_b"]
     layers: dict[int, dict[str, Any]] = {}
     for layer in map(int, config.sweep["coordinate_swap_layers"]):
         pair_deltas = [

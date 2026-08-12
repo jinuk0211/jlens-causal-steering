@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "jlens-causal-pilot-v2"
+SCHEMA_VERSION = "jlens-causal-pilot-v3"
 VALID_METHODS = frozenset({"jlens", "contrastive", "random"})
 VALID_DIRECTIONS = frozenset({"a_to_b", "b_to_a"})
 VALID_POSITIONS = frozenset({"user_span", "system_matched", "prompt_first", "prompt_last"})
@@ -73,7 +73,7 @@ class PilotConfig:
     def direction_fingerprint(self) -> str:
         payload = {
             "config_schema_version": SCHEMA_VERSION,
-            "direction_algorithm": "cross-domain-thought-axis-v1",
+            "direction_algorithm": "lexically-anchored-cross-domain-thought-axis-v2",
             "model": self.model,
             "calibration": {
                 key: self.data[key]
@@ -207,12 +207,23 @@ def load_config(value: str | Path) -> PilotConfig:
     if directions.get("scale") != "mean_residual_norm":
         raise ValueError("directions.scale must be 'mean_residual_norm'")
     target_selection = _require(directions, "target_selection", dict)
-    for key in ("top_k", "min_domain_consistency", "candidate_per_fold", "readout_layer"):
+    for key in (
+        "top_k",
+        "min_domain_consistency",
+        "candidate_per_fold",
+        "min_loo_frequency",
+        "min_lexical_domains",
+        "readout_layer",
+    ):
         value = target_selection.get(key)
         if not isinstance(value, int) or value <= 0:
             raise ValueError(f"directions.target_selection.{key} must be a positive integer")
     if target_selection["min_domain_consistency"] > len(data["calibration_domains"]):
         raise ValueError("target-selection consistency exceeds calibration domain count")
+    if target_selection["min_loo_frequency"] > len(data["calibration_domains"]):
+        raise ValueError("target-selection LOO frequency exceeds calibration domain count")
+    if target_selection["min_lexical_domains"] > len(data["calibration_domains"]):
+        raise ValueError("target-selection lexical coverage exceeds calibration domain count")
 
     layers = _require(sweep, "layers", list)
     coordinate_swap_layers = _require(sweep, "coordinate_swap_layers", list)

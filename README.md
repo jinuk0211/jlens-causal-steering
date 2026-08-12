@@ -13,10 +13,13 @@ target selection or direction construction.
 
 At the pre-response position of layer 30, the runner computes the
 `wrongdoing - safe` Jacobian-lens logit difference within every matched pair.
-It removes tool/XML terms, function words, and domain-specific names, then
-keeps vocabulary tokens whose sign agrees in at least 9 of 12 calibration
-domains. The five highest stable tokens in each direction form transparent,
-effect-weighted readout targets `u_safe` and `u_wrongdoing`.
+It removes tool/XML terms, function words, and domain-specific names. A target
+candidate must be a complete word found in at least three calibration domains
+and be more prevalent in the corresponding safe or wrongdoing documents. Its
+readout sign must agree in at least 9 of 12 domains and it must remain a top
+leave-one-domain-out effect in at least 9 of 12 folds. The five highest stable
+tokens in each direction form transparent targets `u_safe` and
+`u_wrongdoing`, weighted by absolute cross-domain mean effect.
 
 For intervention layer `l` and target `t`, the additive J-lens direction is
 
@@ -96,13 +99,17 @@ Run a fresh corrected 18-generation smoke test:
 jlens-causal all configs/smoke.json --fresh
 ```
 
-Run or resume the 872-generation held-out pilot:
+Run or resume the 4,640-generation powered held-out pilot:
 
 ```bash
 jlens-causal all configs/qwen35_toolalign_pilot.json
 ```
 
-Both configs use deterministic generation and ToolAlign inference's
+The powered pilot covers four held-out domains by four independent documents,
+layers 24/26/28, `alpha={0,.25,.5,1,2,4}`, five norm-matched random seeds, and
+wrong-layer/wrong-position controls at alpha 1 and 2. Alpha 4 is a fixed
+high-dose point and receives no credit when it causes parse errors or
+truncation. Both configs use deterministic generation and ToolAlign inference's
 `max_new_tokens=4096` default. `--fresh` deletes only known runner artifacts.
 Without it, compatible JSONL records resume by deterministic `run_id`. Config,
 target-selection, schema, intervention, and generation changes are included in
@@ -150,7 +157,7 @@ tmux new -s jlens
 source /workspace/jlens-causal-steering/.venv/bin/activate
 export HF_HOME=/workspace/.cache/huggingface
 cd /workspace/jlens-causal-steering
-jlens-causal all configs/qwen35_toolalign_pilot.json 2>&1 | tee outputs/full-pilot.log
+jlens-causal all configs/qwen35_toolalign_pilot.json 2>&1 | tee outputs/powered-pilot.log
 ```
 
 Detach with `Ctrl-b d`; reconnect with `tmux attach -t jlens`.

@@ -83,10 +83,21 @@ from pathlib import Path
 root = Path("outputs/smoke")
 records = [json.loads(line) for line in (root / "runs.jsonl").read_text().splitlines()]
 baselines = [record for record in records if record["method"] == "baseline"]
+selection = json.loads((root / "target_selection.json").read_text())
 assert len(records) == 18, f"expected 18 records, found {len(records)}"
 assert len(baselines) == 2, f"expected two baselines, found {len(baselines)}"
 assert not any(record["truncated"] for record in baselines)
 assert not any(record["behavior"]["parse_error"] for record in baselines)
+assert selection["schema_version"] == "jlens-target-selection-v2"
+for side in ("target_a", "target_b"):
+    assert len(selection[side]) == 5
+    assert all(row["domain_consistency"] >= 9 for row in selection[side])
+    assert all(row["loo_top_frequency"] >= 9 for row in selection[side])
+    assert all(
+        row["lexical_domains_target"] >= 3
+        and row["lexical_domains_target"] > row["lexical_domains_other"]
+        for row in selection[side]
+    )
 required = (
     "target_selection.json",
     "summary.csv",
@@ -96,7 +107,9 @@ required = (
 assert all((root / name).is_file() for name in required)
 with (root / "summary.csv").open(newline="") as handle:
     assert next(csv.reader(handle), None), "summary.csv is empty"
-print("VALID THOUGHT-STEERING SMOKE: 18 records; baselines valid")
+print("VALID THOUGHT-STEERING SMOKE: 18 records; baselines and lexical targets valid")
+print("safe targets:", ", ".join(row["token"] for row in selection["target_a"]))
+print("wrongdoing targets:", ", ".join(row["token"] for row in selection["target_b"]))
 PY
 elif [[ "${MODE}" == "full" ]]; then
   jlens-causal all configs/qwen35_toolalign_pilot.json

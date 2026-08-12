@@ -12,7 +12,11 @@ import numpy as np
 
 from jlens_causal import benchmark
 from jlens_causal.config import load_config
-from jlens_causal.directions import select_stable_targets, transported_target
+from jlens_causal.directions import (
+    scenario_lexicons,
+    select_stable_targets,
+    transported_target,
+)
 from jlens_causal.experiment import (
     GENERATED_ARTIFACTS,
     iter_trial_specs,
@@ -27,7 +31,7 @@ from jlens_causal.interventions import (
 )
 from jlens_causal.metrics import analyze_runs, paired_trial_metrics
 from jlens_causal.modeling import _render_chat_text, _rendered_message_span, completion_status
-from jlens_causal.toolalign import classify_behavior, load_cases, parse_tool_calls
+from jlens_causal.toolalign import ScenarioCase, classify_behavior, load_cases, parse_tool_calls
 
 ROOT = Path(__file__).parents[1]
 
@@ -111,7 +115,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.generation["max_new_tokens"], 4096)
         full = load_config(ROOT / "configs" / "qwen35_toolalign_pilot.json")
         self.assertEqual(full.generation["max_new_tokens"], 4096)
-        self.assertEqual(full.estimated_generations()["total"], 872)
+        self.assertEqual(full.estimated_generations()["total"], 4640)
 
     def test_generation_changes_run_fingerprint_and_ids(self) -> None:
         config = load_config(ROOT / "configs" / "smoke.json")
@@ -252,12 +256,21 @@ class ParserTests(unittest.TestCase):
 
 class DirectionTests(unittest.TestCase):
     def test_cross_domain_stable_target_selection(self) -> None:
-        token_texts = ["good", "bad", "financial", "tool", "mixed", "noise"]
+        token_texts = [
+            "good",
+            "bad",
+            "financial",
+            "tool",
+            "mixed",
+            "noise",
+            "ittest",
+            "ampu",
+        ]
         deltas = np.asarray(
             [
-                [-3.0, 4.0, 99.0, 50.0, 1.0, -0.1],
-                [-2.0, 3.0, -99.0, 50.0, -1.0, 0.2],
-                [-4.0, 2.0, 99.0, 50.0, 1.0, -0.1],
+                [-3.0, 4.0, 99.0, 50.0, 1.0, -0.1, -100.0, 100.0],
+                [-2.0, 3.0, -99.0, 50.0, -1.0, 0.2, -100.0, 100.0],
+                [-4.0, 2.0, 99.0, 50.0, 1.0, -0.1, -100.0, 100.0],
             ]
         )
         selected = select_stable_targets(
@@ -267,12 +280,38 @@ class DirectionTests(unittest.TestCase):
             top_k=1,
             min_domain_consistency=3,
             candidate_per_fold=2,
+            min_loo_frequency=3,
             excluded={"financial", "tool"},
+            target_lexicons={"a": {"good"}, "b": {"bad"}},
         )
         self.assertEqual(selected["target_a"][0]["token"], "good")
         self.assertEqual(selected["target_b"][0]["token"], "bad")
         self.assertEqual(selected["calibration_domains"], ["a", "b", "c"])
-        self.assertEqual(selected["eligible_vocabulary_size"], 4)
+        self.assertEqual(selected["eligible_vocabulary_size"], 6)
+        self.assertEqual(selected["eligible_target_a_size"], 1)
+        self.assertEqual(selected["eligible_target_b_size"], 1)
+        self.assertEqual(selected["weighting"], "absolute_cross_domain_mean_effect")
+
+    def test_scenario_lexicons_require_cross_domain_enrichment(self) -> None:
+        cases = [
+            ScenarioCase("d1", "safe", 1, "transparent excellence shared", ()),
+            ScenarioCase("d1", "wrongdoing", 1, "fraud disclose shared", ()),
+            ScenarioCase("d2", "safe", 1, "transparent excellence shared", ()),
+            ScenarioCase("d2", "wrongdoing", 1, "fraud disclose shared", ()),
+            ScenarioCase("d3", "safe", 1, "transparent unique-safe shared", ()),
+            ScenarioCase("d3", "wrongdoing", 1, "fraud unique-bad shared", ()),
+        ]
+        lexicons, counts = scenario_lexicons(
+            cases,
+            scenario_a="safe",
+            scenario_b="wrongdoing",
+            min_domains=2,
+            excluded=set(),
+        )
+        self.assertEqual(lexicons["safe"], {"excellence", "transparent"})
+        self.assertEqual(lexicons["wrongdoing"], {"disclose", "fraud"})
+        self.assertNotIn("shared", lexicons["safe"])
+        self.assertEqual(counts["fraud"], {"safe": 0, "wrongdoing": 3})
 
     def test_transported_direction_is_exact_and_norm_matched(self) -> None:
         try:
