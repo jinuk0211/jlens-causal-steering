@@ -109,6 +109,58 @@ def _content_positions(offsets: list[tuple[int, int]], *, start: int, end: int) 
     )
 
 
+def _render_chat_text(tokenizer: Any, messages: list[dict[str, str]]) -> str:
+    rendered = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    if not isinstance(rendered, str):
+        raise TypeError("chat template did not return text")
+    return rendered
+
+
+def _rendered_message_span(
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    *,
+    message_index: int,
+    rendered_text: str,
+) -> tuple[int, int]:
+    """Locate content after the chat template has transformed it.
+
+    Qwen's template trims message content, so searching for the source document
+    verbatim fails whenever a benchmark file ends in a newline.  Render a
+    sentinel variant through the same template instead; the unchanged prefix
+    and suffix delimit exactly the content emitted by the template without
+    making assumptions about whitespace or role-marker tokenization.
+    """
+    marker = f"\ue000JLENS_MESSAGE_{message_index}\ue001"
+    while marker in rendered_text or any(marker in str(item.get("content", "")) for item in messages):
+        marker += "_"
+    variant = [dict(item) for item in messages]
+    variant[message_index]["content"] = marker
+    sentinel_text = _render_chat_text(tokenizer, variant)
+    if sentinel_text.count(marker) != 1:
+        raise ValueError(
+            f"chat template did not preserve the message-{message_index} span sentinel exactly once"
+        )
+    marker_start = sentinel_text.index(marker)
+    marker_end = marker_start + len(marker)
+    prefix = sentinel_text[:marker_start]
+    suffix = sentinel_text[marker_end:]
+    if not rendered_text.startswith(prefix) or not rendered_text.endswith(suffix):
+        raise ValueError(
+            f"chat template changes structure when rendering message {message_index} content"
+        )
+    start = len(prefix)
+    end = len(rendered_text) - len(suffix)
+    if start >= end:
+        raise ValueError(f"chat template rendered an empty message-{message_index} content span")
+    return start, end
+
+
 def render_messages(runtime: ModelRuntime, messages: list[dict[str, str]]) -> RenderedPrompt:
     """Render once and retain exact system/user token spans.
 
@@ -118,20 +170,21 @@ def render_messages(runtime: ModelRuntime, messages: list[dict[str, str]]) -> Re
     """
     if len(messages) != 2 or [item.get("role") for item in messages] != ["system", "user"]:
         raise ValueError("the isolated pilot requires exactly one system and one user message")
-    rendered_text = runtime.tokenizer.apply_chat_template(
+    rendered_text = _render_chat_text(runtime.tokenizer, messages)
+    system_start, system_end = _rendered_message_span(
+        runtime.tokenizer,
         messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
+        message_index=0,
+        rendered_text=rendered_text,
     )
-    if not isinstance(rendered_text, str):
-        raise TypeError("chat template did not return text")
-    system_text = str(messages[0]["content"])
-    user_text = str(messages[1]["content"])
-    system_start = rendered_text.find(system_text)
-    user_start = rendered_text.rfind(user_text)
-    if system_start < 0 or user_start < 0 or user_start <= system_start:
-        raise ValueError("could not locate system/user content in the rendered chat template")
+    user_start, user_end = _rendered_message_span(
+        runtime.tokenizer,
+        messages,
+        message_index=1,
+        rendered_text=rendered_text,
+    )
+    if system_end > user_start:
+        raise ValueError("rendered system and user content spans overlap or are out of order")
 
     with_offsets = runtime.tokenizer(
         rendered_text,
@@ -178,12 +231,12 @@ def render_messages(runtime: ModelRuntime, messages: list[dict[str, str]]) -> Re
     user_positions = _content_positions(
         offsets,
         start=user_start,
-        end=user_start + len(user_text),
+        end=user_end,
     )
     system_positions = _content_positions(
         offsets,
         start=system_start,
-        end=system_start + len(system_text),
+        end=system_end,
     )
     if not user_positions or not system_positions:
         raise ValueError("rendered prompt has an empty system or user token span")

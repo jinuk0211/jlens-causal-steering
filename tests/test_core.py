@@ -26,7 +26,7 @@ from jlens_causal.interventions import (
     matched_prompt_positions,
 )
 from jlens_causal.metrics import analyze_runs, paired_trial_metrics
-from jlens_causal.modeling import completion_status
+from jlens_causal.modeling import _render_chat_text, _rendered_message_span, completion_status
 from jlens_causal.toolalign import classify_behavior, load_cases, parse_tool_calls
 
 ROOT = Path(__file__).parents[1]
@@ -332,6 +332,41 @@ class InterventionTests(unittest.TestCase):
 
 
 class GenerationTests(unittest.TestCase):
+    def test_qwen_style_template_trim_does_not_break_message_spans(self) -> None:
+        class QwenStyleTokenizer:
+            def apply_chat_template(
+                self,
+                conversation,
+                *,
+                tokenize,
+                add_generation_prompt,
+                enable_thinking,
+            ):
+                self.assert_template_options = (tokenize, add_generation_prompt, enable_thinking)
+                system = str(conversation[0]["content"]).strip()
+                user = str(conversation[1]["content"]).strip()
+                return (
+                    f"<|im_start|>system\n{system}<|im_end|>\n"
+                    f"<|im_start|>user\n{user}<|im_end|>\n"
+                    "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                )
+
+        tokenizer = QwenStyleTokenizer()
+        messages = [
+            {"role": "system", "content": "  system policy\n"},
+            {"role": "user", "content": "document ending in a newline\n"},
+        ]
+        rendered = _render_chat_text(tokenizer, messages)
+        system_span = _rendered_message_span(
+            tokenizer, messages, message_index=0, rendered_text=rendered
+        )
+        user_span = _rendered_message_span(
+            tokenizer, messages, message_index=1, rendered_text=rendered
+        )
+        self.assertEqual(rendered[slice(*system_span)], "system policy")
+        self.assertEqual(rendered[slice(*user_span)], "document ending in a newline")
+        self.assertLess(system_span[1], user_span[0])
+
     def test_token_limit_without_eos_is_truncated(self) -> None:
         self.assertEqual(
             completion_status([1, 2, 3], max_new_tokens=3, eos_token_ids={99}),
