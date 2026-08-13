@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import importlib.util
 import json
 import sys
@@ -24,6 +25,14 @@ from jlens_causal.experiment import (
     trial_run_id,
     validate_output_compatibility,
 )
+from jlens_causal.followup import (
+    analyze_followup,
+    classify_followup,
+    contrastive_response_direction,
+    iter_followup_specs,
+    matched_followup_control_positions,
+)
+from jlens_causal.followup_config import load_followup_config
 from jlens_causal.interventions import (
     AdditiveOperator,
     intervention_hook,
@@ -125,6 +134,24 @@ class ConfigTests(unittest.TestCase):
         spec = next(iter(iter_trial_specs(config)))
         self.assertNotEqual(config.run_fingerprint, changed.run_fingerprint)
         self.assertNotEqual(trial_run_id(config, spec), trial_run_id(changed, spec))
+
+    def test_followup_counts_and_fresh_calibration_cost(self) -> None:
+        smoke = load_followup_config(ROOT / "configs" / "followup_smoke.json")
+        self.assertEqual(smoke.estimated_generations()["direction_calibration"], 96)
+        self.assertEqual(smoke.estimated_generations()["sweep_total"], 22)
+        self.assertEqual(smoke.estimated_generations()["fresh_total"], 118)
+        self.assertEqual(len(list(iter_followup_specs(smoke))), 22)
+        powered = load_followup_config(ROOT / "configs" / "followup_powered.json")
+        self.assertEqual(powered.estimated_generations()["sweep_total"], 5536)
+        self.assertEqual(powered.estimated_generations()["fresh_total"], 5632)
+
+    def test_followup_calibration_generation_changes_direction_fingerprint(self) -> None:
+        config = load_followup_config(ROOT / "configs" / "followup_smoke.json")
+        changed_raw = json.loads(json.dumps(config.raw))
+        changed_raw["generation"]["seed"] += 1
+        changed = replace(config, raw=changed_raw)
+        self.assertNotEqual(config.direction_fingerprint, changed.direction_fingerprint)
+        self.assertNotEqual(config.run_fingerprint, changed.run_fingerprint)
 
     def test_fresh_removes_only_owned_artifacts(self) -> None:
         config = load_config(ROOT / "configs" / "smoke.json")
@@ -234,6 +261,18 @@ class ParserTests(unittest.TestCase):
             [],
         )
 
+    def test_followup_classifies_stop_repeat_and_corruption(self) -> None:
+        stop = classify_followup("Task complete.", truncated=False)
+        repeat = classify_followup(
+            "<tool_call><tool_name>x</tool_name><arguments>{}</arguments></tool_call>",
+            truncated=False,
+        )
+        invalid = classify_followup("<tool_call><tool_name>x", truncated=False)
+        self.assertEqual(stop["decision"], "stop")
+        self.assertEqual(repeat["decision"], "repeat")
+        self.assertEqual(invalid["decision"], "invalid")
+        self.assertTrue(invalid["parse_error"])
+
     def test_toolalign_email_taxonomy(self) -> None:
         tools = benchmark.BASE_TOOLS
         internal = classify_behavior(
@@ -326,6 +365,19 @@ class DirectionTests(unittest.TestCase):
         torch.testing.assert_close(actual, expected)
         self.assertAlmostEqual(float(actual.norm()), 7.0, places=5)
 
+    def test_followup_contrastive_is_empirical_stop_minus_repeat(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        actual = contrastive_response_direction(
+            torch,
+            stop_samples=[torch.tensor([3.0, 1.0]), torch.tensor([5.0, 1.0])],
+            repeat_samples=[torch.tensor([1.0, 1.0]), torch.tensor([1.0, 1.0])],
+            scale=6.0,
+        )
+        torch.testing.assert_close(actual, torch.tensor([6.0, 0.0]))
+
 
 class InterventionTests(unittest.TestCase):
     def test_system_control_matches_user_token_dose(self) -> None:
@@ -368,6 +420,13 @@ class InterventionTests(unittest.TestCase):
         torch.testing.assert_close(first[0, 1], torch.ones(2))
         torch.testing.assert_close(first[0, 0], torch.zeros(2))
         torch.testing.assert_close(second, decode)
+
+    def test_followup_wrong_position_has_exactly_matched_token_dose(self) -> None:
+        document = tuple(range(10, 20))
+        result = tuple(range(30, 34))
+        control = matched_followup_control_positions(document, result)
+        self.assertEqual(control, (16, 17, 18, 19))
+        self.assertEqual(len(control), len(result))
 
 
 class GenerationTests(unittest.TestCase):
@@ -514,6 +573,49 @@ class MetricTests(unittest.TestCase):
             self.assertTrue((config.output_dir / "summary.csv").is_file())
             self.assertTrue((config.output_dir / "thought_trajectories.csv").is_file())
             self.assertTrue((config.output_dir / "behavior_profiles.csv").is_file())
+
+    def test_followup_analysis_subtracts_random_on_source_matched_cases(self) -> None:
+        config = load_followup_config(ROOT / "configs" / "followup_smoke.json")
+
+        def followup_record(method: str, decision: str, thought: float) -> dict:
+            baseline = method == "baseline"
+            return {
+                "run_id": method,
+                "run_fingerprint": config.run_fingerprint,
+                "domain": "nuclear-energy",
+                "document": 1,
+                "scenario_type": "safe",
+                "condition": "tamely-with-reasoning",
+                "direction": "none" if baseline else "repeat_to_stop",
+                "method": method,
+                "vector_layer": None if baseline else 20,
+                "applied_layer": None if baseline else 20,
+                "alpha": 0.0 if baseline else 1.0,
+                "site": "baseline" if baseline else "tool_result",
+                "followup": {"decision": decision, "valid": True},
+                "thought_trace": {"pre_response_last": thought},
+            }
+
+        records = [
+            followup_record("baseline", "repeat", 0.0),
+            followup_record("random", "repeat", 0.0),
+            followup_record("jlens", "stop", 2.0),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(config, output_dir=Path(temporary))
+            with config.records_path.open("w", encoding="utf-8") as handle:
+                for item in records:
+                    item["run_fingerprint"] = config.run_fingerprint
+                    handle.write(json.dumps(item) + "\n")
+            analyze_followup(config)
+            with (config.output_dir / "followup_trial_metrics.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+            jlens = next(row for row in rows if row["method"] == "jlens")
+            self.assertEqual(float(jlens["causal_delta_behavior_vs_random"]), 1.0)
+            self.assertEqual(float(jlens["causal_delta_thought_vs_random"]), 2.0)
+            self.assertEqual(int(jlens["joint_causal_success"]), 1)
 
 
 if __name__ == "__main__":

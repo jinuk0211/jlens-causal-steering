@@ -35,6 +35,15 @@ class RenderedPrompt:
 
 
 @dataclass(frozen=True)
+class RenderedConversation:
+    """Tokenized multi-turn chat with exact template-rendered message spans."""
+
+    input_ids: Any
+    attention_mask: Any
+    message_positions: dict[int, tuple[int, ...]]
+
+
+@dataclass(frozen=True)
 class GenerationResult:
     text: str
     completion_ids: list[int]
@@ -137,7 +146,9 @@ def _rendered_message_span(
     making assumptions about whitespace or role-marker tokenization.
     """
     marker = f"\ue000JLENS_MESSAGE_{message_index}\ue001"
-    while marker in rendered_text or any(marker in str(item.get("content", "")) for item in messages):
+    while marker in rendered_text or any(
+        marker in str(item.get("content", "")) for item in messages
+    ):
         marker += "_"
     variant = [dict(item) for item in messages]
     variant[message_index]["content"] = marker
@@ -159,6 +170,88 @@ def _rendered_message_span(
     if start >= end:
         raise ValueError(f"chat template rendered an empty message-{message_index} content span")
     return start, end
+
+
+def render_conversation(
+    runtime: ModelRuntime,
+    messages: list[dict[str, str]],
+    *,
+    message_indices: Iterable[int],
+) -> RenderedConversation:
+    """Render an arbitrary chat and retain selected message-content token spans."""
+    indices = tuple(sorted(set(int(index) for index in message_indices)))
+    if not messages or not indices:
+        raise ValueError("messages and message_indices cannot be empty")
+    if indices[0] < 0 or indices[-1] >= len(messages):
+        raise ValueError("message index is outside the conversation")
+    rendered_text = _render_chat_text(runtime.tokenizer, messages)
+    character_spans = {
+        index: _rendered_message_span(
+            runtime.tokenizer,
+            messages,
+            message_index=index,
+            rendered_text=rendered_text,
+        )
+        for index in indices
+    }
+    with_offsets = runtime.tokenizer(
+        rendered_text,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+        return_tensors="pt",
+    )
+    offset_ids = with_offsets["input_ids"]
+    offsets_value = with_offsets["offset_mapping"]
+    offsets = [tuple(map(int, pair)) for pair in offsets_value[0].tolist()]
+    encoded = runtime.tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=False,
+        return_tensors="pt",
+    )
+    if hasattr(encoded, "input_ids"):
+        input_ids = encoded.input_ids
+        attention_mask = getattr(encoded, "attention_mask", None)
+    elif isinstance(encoded, dict):
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded.get("attention_mask")
+    else:
+        input_ids = encoded
+        attention_mask = None
+    if input_ids.ndim == 1:
+        input_ids = input_ids.unsqueeze(0)
+    if offset_ids.ndim == 1:
+        offset_ids = offset_ids.unsqueeze(0)
+    if input_ids.detach().cpu().tolist() != offset_ids.detach().cpu().tolist():
+        special_id = getattr(runtime.tokenizer, "bos_token_id", None)
+        offset_values = offset_ids.detach().cpu().tolist()
+        input_values = input_ids.detach().cpu().tolist()
+        if (
+            special_id is not None
+            and len(input_values[0]) == len(offset_values[0]) + 1
+            and input_values[0][0] == int(special_id)
+            and input_values[0][1:] == offset_values[0]
+        ):
+            offsets.insert(0, (0, 0))
+        else:
+            raise ValueError("chat-template tokens disagree with offset-mapped tokenizer output")
+    positions = {
+        index: _content_positions(offsets, start=span[0], end=span[1])
+        for index, span in character_spans.items()
+    }
+    if any(not value for value in positions.values()):
+        raise ValueError("rendered conversation has an empty selected message span")
+    input_ids = input_ids.to(runtime.device)
+    if attention_mask is None:
+        attention_mask = runtime.torch.ones_like(input_ids)
+    elif attention_mask.ndim == 1:
+        attention_mask = attention_mask.unsqueeze(0)
+    return RenderedConversation(
+        input_ids=input_ids,
+        attention_mask=attention_mask.to(runtime.device),
+        message_positions=positions,
+    )
 
 
 def render_messages(runtime: ModelRuntime, messages: list[dict[str, str]]) -> RenderedPrompt:

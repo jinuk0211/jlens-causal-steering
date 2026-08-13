@@ -166,3 +166,37 @@ References: [Jacobian Lens](https://transformer-circuits.pub/2026/workspace/),
 [official implementation](https://github.com/anthropics/jacobian-lens),
 [ToolAlignBench](https://github.com/aryankeluskar/ToolAlignBench), and
 [Contrastive Activation Addition](https://github.com/nrimsky/CAA).
+
+## Post-success stop/repeat steering
+
+The page-derived follow-up experiment targets the strongest observed ToolAlign
+state transition: after a controlled `writeInternalLog` call returns a real
+successful `<tool_result>`, should the model stop or issue another tool call?
+The intervention is applied once to the tool-result message tokens. The next
+independent model response is the behavioral outcome, so this changes the
+actual post-tool decision rather than merely changing an offline J-lens score.
+
+The completion concept axis is preregistered from the analysis page as
+`u_stop - u_repeat`. J-lens uses the exact
+`normalize(J.T @ (u_stop - u_repeat))` direction. The contrastive control is
+estimated only from 12 calibration domains as
+`normalize(mean(h_stop) - mean(h_repeat))`, where stop/repeat labels come from
+the model's genuine unsteered post-success response. Evaluation uses four
+disjoint domains. Both directions, norm-matched random vectors, wrong layer,
+and token-count-matched wrong position are included.
+
+The smoke sweep writes 22 evaluation records after 96 held-out calibration
+responses. The powered sweep writes 5,536 evaluation records (plus the same 96
+calibration responses when directions are freshly extracted), using layers
+20/24 and `alpha={.25,.5,1,2,4}` with five random seeds.
+
+On a new Vast.ai instance, the following single command installs everything,
+runs and validates the smoke test, then launches the powered run in a detached
+`tmux` session (or `nohup` when tmux is unavailable):
+
+```bash
+cd /workspace && curl -fsSL https://raw.githubusercontent.com/jinuk0211/jlens-causal-steering/agent/jlens-thought-steering/scripts/vast_followup.sh | bash -s -- all agent/jlens-thought-steering
+```
+
+Monitor it with `tmux attach -t jlens-followup` or
+`tail -f /workspace/jlens-causal-steering/outputs/followup-powered.log`.
