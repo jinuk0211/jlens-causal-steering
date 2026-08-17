@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# TauBench official no-steering baseline on a fresh Vast.ai Ubuntu instance.
+# This runs the complete validation and evaluation splits, not a pilot subset.
+# Run with: bash "taubench no pilot.txt"
+
+WORKSPACE="${WORKSPACE:-/workspace}"
+STEERING_DIR="${WORKSPACE}/jlens-causal-steering"
+TAU_DIR="${WORKSPACE}/tau2-bench"
+VENV_DIR="${STEERING_DIR}/.venv"
+
+STEERING_REPO="https://github.com/jinuk0211/jlens-causal-steering.git"
+STEERING_BRANCH="agent/jlens-thought-steering"
+STEERING_COMMIT="bfc6256140e0e9758466f2dff069475c7b7eda69"
+
+TAU_REPO="https://github.com/jinuk0211/tau2-bench.git"
+TAU_BRANCH="codex/jlens-telecom-backend"
+TAU_COMMIT="1a7350b941c345c1f798acd0f772862dbf983683"
+
+TAUBENCH_MODEL="Qwen/Qwen3.5-4B"
+TAUBENCH_REVISION="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+WORKER_HOST="127.0.0.1"
+WORKER_PORT="${WORKER_PORT:-8877}"
+
+export HF_HOME="${HF_HOME:-${WORKSPACE}/.cache/huggingface}"
+export TOKENIZERS_PARALLELISM=false
+export HF_HUB_DISABLE_TELEMETRY=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+: "${HF_TOKEN:?Set HF_TOKEN to your Hugging Face token}"
+: "${OPENAI_API_KEY:?Set OPENAI_API_KEY for the Tau2 user simulator and reviewer}"
+
+ensure_host_tools() {
+  if command -v git >/dev/null && command -v curl >/dev/null; then
+    return
+  fi
+  if ! command -v apt-get >/dev/null; then
+    echo "git and curl are required" >&2
+    exit 1
+  fi
+  apt-get update
+  apt-get install -y git curl ca-certificates
+}
+
+checkout_required_repo() {
+  local repo_url="$1"
+  local branch="$2"
+  local commit="$3"
+  local destination="$4"
+
+  if [[ -e "${destination}" && ! -d "${destination}/.git" ]]; then
+    echo "${destination} exists but is not a Git repository" >&2
+    exit 1
+  fi
+  if [[ ! -d "${destination}/.git" ]]; then
+    git clone --branch "${branch}" --single-branch "${repo_url}" "${destination}"
+  else
+    git -C "${destination}" fetch origin \
+      "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+    git -C "${destination}" checkout "${branch}"
+    git -C "${destination}" merge --ff-only "origin/${branch}"
+  fi
+  if ! git -C "${destination}" merge-base --is-ancestor "${commit}" HEAD; then
+    echo "${destination} does not contain required commit ${commit}" >&2
+    exit 1
+  fi
+  echo "$(basename "${destination}"): $(git -C "${destination}" rev-parse HEAD)"
+}
+
+ensure_uv() {
+  if ! command -v uv >/dev/null; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="${HOME}/.local/bin:${PATH}"
+  fi
+  command -v uv >/dev/null
+}
+
+ensure_host_tools
+mkdir -p "${WORKSPACE}" "${HF_HOME}"
+checkout_required_repo \
+  "${STEERING_REPO}" "${STEERING_BRANCH}" "${STEERING_COMMIT}" "${STEERING_DIR}"
+checkout_required_repo \
+  "${TAU_REPO}" "${TAU_BRANCH}" "${TAU_COMMIT}" "${TAU_DIR}"
+
+ensure_uv
+uv python install 3.12
+if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+  uv venv --python 3.12 "${VENV_DIR}"
+fi
+source "${VENV_DIR}/bin/activate"
+uv pip install -e "${STEERING_DIR}"
+uv pip install -e "${TAU_DIR}[knowledge]"
+
+export TAUBENCH_MODEL TAUBENCH_REVISION
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest = Path(os.environ["VIRTUAL_ENV"]).parent / "configs" / (
+    "taubench_airline_failure_modes_qwen35_4b.json"
+)
+config = json.loads(manifest.read_text(encoding="utf-8"))
+model = config["model"]
+generation = config["generation"]
+assert model["model_id"] == os.environ["TAUBENCH_MODEL"]
+assert model["model_revision"] == os.environ["TAUBENCH_REVISION"]
+assert model["dtype"] == "bfloat16"
+assert generation["do_sample"] is False
+assert generation["seed"] == 300
+assert generation["hf_chat_template_kwargs"]["enable_thinking"] is False
+print("TauBench model config verified:", model["model_id"], model["model_revision"])
+PY
+
+python - <<'PY'
+import torch
+
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA is not available")
+if not torch.cuda.is_bf16_supported():
+    raise SystemExit("The selected GPU does not support bfloat16")
+print("torch:", torch.__version__)
+print("GPU:", torch.cuda.get_device_name(0))
+print("BF16: supported")
+PY
+
+if [[ "${SKIP_MODEL_DOWNLOAD:-0}" != "1" ]]; then
+  hf download "${TAUBENCH_MODEL}" --revision "${TAUBENCH_REVISION}"
+fi
+
+cd "${STEERING_DIR}"
+mkdir -p outputs
+MATRIX="${STEERING_DIR}/outputs/taubench-airline-failure-matrix.json"
+python -m jlens_causal.failure_cli compile \
+  configs/taubench_airline_failure_modes_qwen35_4b.json \
+  --output "${MATRIX}"
+
+export JLENS_REMOTE_TOKEN="${JLENS_REMOTE_TOKEN:-$(python -c 'import secrets; print(secrets.token_urlsafe(48))')}"
+export JLENS_REMOTE_ENDPOINT="http://${WORKER_HOST}:${WORKER_PORT}"
+
+WORKER_LOG="${WORKSPACE}/jlens-remote-worker.log"
+WORKER_PID=""
+cleanup() {
+  if [[ -n "${WORKER_PID}" ]] && kill -0 "${WORKER_PID}" 2>/dev/null; then
+    kill "${WORKER_PID}" 2>/dev/null || true
+    wait "${WORKER_PID}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+cd "${TAU_DIR}"
+python scripts/jlens_remote_worker.py \
+  --host "${WORKER_HOST}" \
+  --port "${WORKER_PORT}" \
+  >"${WORKER_LOG}" 2>&1 &
+WORKER_PID=$!
+
+worker_ready=0
+for _ in $(seq 1 60); do
+  if curl -fsS "${JLENS_REMOTE_ENDPOINT}/health" >/dev/null; then
+    worker_ready=1
+    break
+  fi
+  if ! kill -0 "${WORKER_PID}" 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+if [[ "${worker_ready}" != "1" ]]; then
+  echo "Remote worker failed to become ready; log follows" >&2
+  cat "${WORKER_LOG}" >&2
+  exit 1
+fi
+
+python scripts/preflight_failure_steering.py \
+  "${MATRIX}" \
+  --method baseline \
+  --require-hf-token
+
+read -r -a SPLIT_LIST <<< "${SPLITS:-validation evaluation}"
+for split in "${SPLIT_LIST[@]}"; do
+  echo "===== TauBench no-steering baseline: ${split} ====="
+  python scripts/run_airline_failure_steering.py \
+    "${MATRIX}" \
+    --condition baseline \
+    --split "${split}" \
+    --review
+done
+
+echo "TauBench no-steering baseline complete"
+echo "Validation: ${TAU_DIR}/data/simulations/failure-steering/validation/baseline/"
+echo "Evaluation: ${TAU_DIR}/data/simulations/failure-steering/evaluation/baseline/"
+echo "Worker log: ${WORKER_LOG}"
