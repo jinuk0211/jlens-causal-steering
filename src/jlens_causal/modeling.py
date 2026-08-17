@@ -61,11 +61,51 @@ def _resolve_dtype(torch: Any, value: str) -> Any:
     return dtype
 
 
+def _pretrained_source(model_config: dict[str, Any]) -> tuple[str, str | None]:
+    """Resolve an optional local checkpoint without changing model identity."""
+
+    local_path = model_config.get("local_path")
+    if local_path is None:
+        return str(model_config["model_id"]), model_config.get("model_revision")
+    from pathlib import Path
+
+    path = Path(str(local_path)).expanduser().resolve()
+    if not path.is_dir():
+        raise FileNotFoundError(f"local model checkpoint is missing: {path}")
+    return str(path), None
+
+
+def _load_pretrained_hf_model(
+    model_config: dict[str, Any],
+    *,
+    source: str,
+    common_kwargs: dict[str, Any],
+    model_kwargs: dict[str, Any],
+) -> Any:
+    """Load the checkpoint, optionally excluding Qwen3.5 vision modules."""
+
+    from transformers import AutoModelForCausalLM
+
+    if not bool(model_config.get("text_only", False)):
+        return AutoModelForCausalLM.from_pretrained(source, **model_kwargs)
+    if str(model_config.get("model_id", "")) != "Qwen/Qwen3.5-4B":
+        raise ValueError("text_only is currently verified only for Qwen/Qwen3.5-4B")
+    from transformers import Qwen3_5Config, Qwen3_5ForCausalLM
+
+    multimodal_config = Qwen3_5Config.from_pretrained(source, **common_kwargs)
+    return Qwen3_5ForCausalLM.from_pretrained(
+        source,
+        config=multimodal_config.text_config,
+        key_mapping={r"^model\.language_model\.": "model."},
+        **model_kwargs,
+    )
+
+
 def load_runtime(model_config: dict[str, Any]) -> ModelRuntime:
     """Load one pinned model/tokenizer/lens bundle onto a single device."""
     import jlens
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     requested_device = str(model_config.get("device", "auto"))
     device = (
@@ -74,20 +114,26 @@ def load_runtime(model_config: dict[str, Any]) -> ModelRuntime:
     if device == "auto":
         device = "cpu"
     dtype = _resolve_dtype(torch, str(model_config.get("dtype", "auto")))
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_config["model_id"],
-        revision=model_config["model_revision"],
-        trust_remote_code=bool(model_config.get("trust_remote_code", False)),
-    )
+    source, revision = _pretrained_source(model_config)
+    common_kwargs: dict[str, Any] = {
+        "trust_remote_code": bool(model_config.get("trust_remote_code", False))
+    }
+    if revision is not None:
+        common_kwargs["revision"] = revision
+    tokenizer = AutoTokenizer.from_pretrained(source, **common_kwargs)
     kwargs: dict[str, Any] = {
-        "revision": model_config["model_revision"],
+        **common_kwargs,
         "dtype": dtype,
-        "trust_remote_code": bool(model_config.get("trust_remote_code", False)),
     }
     attention = str(model_config.get("attention", "auto"))
     if attention != "auto":
         kwargs["attn_implementation"] = attention
-    hf_model = AutoModelForCausalLM.from_pretrained(model_config["model_id"], **kwargs)
+    hf_model = _load_pretrained_hf_model(
+        model_config,
+        source=source,
+        common_kwargs=common_kwargs,
+        model_kwargs=kwargs,
+    )
     hf_model.to(device)
     hf_model.eval()
     lens_model = jlens.from_hf(hf_model, tokenizer, force_bos=False)
@@ -110,6 +156,58 @@ def load_runtime(model_config: dict[str, Any]) -> ModelRuntime:
     )
 
 
+def load_hf_runtime(model_config: dict[str, Any]) -> ModelRuntime:
+    """Load a plain HF checkpoint for published steering baselines.
+
+    CAA and most of the Core-7 baselines need residual-block access but do not
+    require a fitted Jacobian lens.  Keeping this loader separate prevents an
+    unavailable lens checkpoint from becoming an accidental baseline
+    dependency while retaining the same block abstraction used by our hooks.
+    """
+    import jlens
+    import torch
+    from transformers import AutoTokenizer
+
+    requested_device = str(model_config.get("device", "auto"))
+    device = (
+        "cuda" if requested_device == "auto" and torch.cuda.is_available() else requested_device
+    )
+    if device == "auto":
+        device = "cpu"
+    dtype = _resolve_dtype(torch, str(model_config.get("dtype", "auto")))
+    source, revision = _pretrained_source(model_config)
+    common_kwargs: dict[str, Any] = {
+        "trust_remote_code": bool(model_config.get("trust_remote_code", False))
+    }
+    if revision is not None:
+        common_kwargs["revision"] = revision
+    tokenizer = AutoTokenizer.from_pretrained(
+        source,
+        **common_kwargs,
+    )
+    model_kwargs = {**common_kwargs, "dtype": dtype}
+    attention = str(model_config.get("attention", "auto"))
+    if attention != "auto":
+        model_kwargs["attn_implementation"] = attention
+    hf_model = _load_pretrained_hf_model(
+        model_config,
+        source=source,
+        common_kwargs=common_kwargs,
+        model_kwargs=model_kwargs,
+    )
+    hf_model.to(device)
+    hf_model.eval()
+    lens_model = jlens.from_hf(hf_model, tokenizer, force_bos=False)
+    return ModelRuntime(
+        torch=torch,
+        tokenizer=tokenizer,
+        hf_model=hf_model,
+        lens_model=lens_model,
+        lens=None,
+        device=lens_model.input_device,
+    )
+
+
 def _content_positions(offsets: list[tuple[int, int]], *, start: int, end: int) -> tuple[int, ...]:
     return tuple(
         index
@@ -118,11 +216,16 @@ def _content_positions(offsets: list[tuple[int, int]], *, start: int, end: int) 
     )
 
 
-def _render_chat_text(tokenizer: Any, messages: list[dict[str, str]]) -> str:
+def _render_chat_text(
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    *,
+    add_generation_prompt: bool = True,
+) -> str:
     rendered = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=True,
+        add_generation_prompt=add_generation_prompt,
         enable_thinking=False,
     )
     if not isinstance(rendered, str):
@@ -136,6 +239,7 @@ def _rendered_message_span(
     *,
     message_index: int,
     rendered_text: str,
+    add_generation_prompt: bool = True,
 ) -> tuple[int, int]:
     """Locate content after the chat template has transformed it.
 
@@ -152,7 +256,11 @@ def _rendered_message_span(
         marker += "_"
     variant = [dict(item) for item in messages]
     variant[message_index]["content"] = marker
-    sentinel_text = _render_chat_text(tokenizer, variant)
+    sentinel_text = _render_chat_text(
+        tokenizer,
+        variant,
+        add_generation_prompt=add_generation_prompt,
+    )
     if sentinel_text.count(marker) != 1:
         raise ValueError(
             f"chat template did not preserve the message-{message_index} span sentinel exactly once"
@@ -177,6 +285,7 @@ def render_conversation(
     messages: list[dict[str, str]],
     *,
     message_indices: Iterable[int],
+    add_generation_prompt: bool = True,
 ) -> RenderedConversation:
     """Render an arbitrary chat and retain selected message-content token spans."""
     indices = tuple(sorted(set(int(index) for index in message_indices)))
@@ -184,13 +293,18 @@ def render_conversation(
         raise ValueError("messages and message_indices cannot be empty")
     if indices[0] < 0 or indices[-1] >= len(messages):
         raise ValueError("message index is outside the conversation")
-    rendered_text = _render_chat_text(runtime.tokenizer, messages)
+    rendered_text = _render_chat_text(
+        runtime.tokenizer,
+        messages,
+        add_generation_prompt=add_generation_prompt,
+    )
     character_spans = {
         index: _rendered_message_span(
             runtime.tokenizer,
             messages,
             message_index=index,
             rendered_text=rendered_text,
+            add_generation_prompt=add_generation_prompt,
         )
         for index in indices
     }
@@ -206,7 +320,7 @@ def render_conversation(
     encoded = runtime.tokenizer.apply_chat_template(
         messages,
         tokenize=True,
-        add_generation_prompt=True,
+        add_generation_prompt=add_generation_prompt,
         enable_thinking=False,
         return_tensors="pt",
     )
@@ -400,6 +514,29 @@ def capture_block_outputs(blocks: Any, layers: Iterable[int]):
     try:
         for layer in sorted(set(layers)):
             handles.append(blocks[layer].register_forward_hook(make_hook(layer)))
+        yield activations
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+@contextmanager
+def capture_block_inputs(blocks: Any, layers: Iterable[int]):
+    """Capture the first positional input to selected transformer blocks."""
+    activations: dict[int, Any] = {}
+    handles = []
+
+    def make_hook(index: int):
+        def hook(_module: Any, inputs: Any) -> None:
+            if not inputs or not hasattr(inputs[0], "shape"):
+                raise TypeError(f"transformer block {index} has no tensor first input")
+            activations[index] = inputs[0]
+
+        return hook
+
+    try:
+        for layer in sorted(set(layers)):
+            handles.append(blocks[layer].register_forward_pre_hook(make_hook(layer)))
         yield activations
     finally:
         for handle in handles:

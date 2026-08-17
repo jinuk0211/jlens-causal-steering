@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -121,6 +122,564 @@ def intervention_hook(
         yield
     finally:
         handle.remove()
+
+
+@contextmanager
+def generation_intervention_hook(
+    blocks: Any,
+    *,
+    layer: int,
+    operator: Operator,
+    apply_prefill_decision: bool = True,
+    apply_decode: bool = True,
+):
+    """Apply a published generation-time intervention at assistant positions.
+
+    The first block call is prompt prefill.  Only its final residual, which
+    predicts the first assistant token, is modified.  Cached decode calls then
+    contain the current generated token and are modified one at a time.  This
+    reproduces CAA's "after the instruction" site without altering the system,
+    tool schema, user document, or earlier trajectory tokens.
+
+    The yielded trace is written into experiment records so a run can verify
+    the exact intervention dose rather than inferring it from configuration.
+    """
+    call_index = 0
+    trace: dict[str, Any] = {
+        "layer": int(layer),
+        "prefill_calls": 0,
+        "decode_calls": 0,
+        "applied_prefill_positions": 0,
+        "applied_decode_positions": 0,
+    }
+
+    def hook(_module: Any, _inputs: Any, output: Any) -> Any:
+        nonlocal call_index
+        tensor = output if hasattr(output, "shape") else output[0]
+        is_prefill = call_index == 0
+        call_index += 1
+        if is_prefill:
+            trace["prefill_calls"] += 1
+            should_apply = apply_prefill_decision
+        else:
+            trace["decode_calls"] += 1
+            should_apply = apply_decode
+        if not should_apply:
+            return output
+        modified = tensor.clone()
+        modified[:, -1, :] = operator(modified[:, -1, :])
+        if is_prefill:
+            trace["applied_prefill_positions"] += int(modified.shape[0])
+        else:
+            trace["applied_decode_positions"] += int(modified.shape[0])
+        return _replace_output(output, modified)
+
+    handle = blocks[int(layer)].register_forward_hook(hook)
+    try:
+        yield trace
+    finally:
+        handle.remove()
+
+
+@contextmanager
+def cast_generation_hook(
+    blocks: Any,
+    *,
+    condition_layer: int,
+    behavior_layer: int,
+    condition_direction: Any,
+    threshold: float,
+    comparator: str,
+    comparison_mode: str,
+    operator: Operator,
+    prefill_mode: str = "all_tokens",
+    apply_decode: bool = True,
+    gate_override: bool | None = None,
+):
+    """Apply CAST's behavior vector only when its prompt condition fires.
+
+    Both measurements and additions are pre-layer, matching the official
+    ``LeashLayer`` wrapper.  ``all_tokens`` is the official first-call dose;
+    ``decision_only`` is the site-matched control used beside CAA.
+    """
+    from jlens_causal.baselines import cast_condition_similarity
+
+    condition_layer = int(condition_layer)
+    behavior_layer = int(behavior_layer)
+    if condition_layer > behavior_layer:
+        raise ValueError("CAST condition layer must not follow its behavior layer")
+    if comparator not in {"greater", "less"}:
+        raise ValueError("CAST comparator must be 'greater' or 'less'")
+    if comparison_mode not in {"mean", "last"}:
+        raise ValueError("CAST comparison_mode must be 'mean' or 'last'")
+    if prefill_mode not in {"all_tokens", "decision_only"}:
+        raise ValueError("CAST prefill_mode must be 'all_tokens' or 'decision_only'")
+
+    condition_calls = 0
+    behavior_calls = 0
+    gate_triggered: bool | None = None
+    trace: dict[str, Any] = {
+        "condition_layer": condition_layer,
+        "behavior_layer": behavior_layer,
+        "condition_threshold": float(threshold),
+        "condition_comparator": comparator,
+        "condition_comparison_mode": comparison_mode,
+        "prefill_mode": prefill_mode,
+        "condition_score": None,
+        "natural_gate_triggered": None,
+        "gate_override": gate_override,
+        "gate_triggered": None,
+        "condition_calls": 0,
+        "behavior_prefill_calls": 0,
+        "behavior_decode_calls": 0,
+        "applied_prefill_positions": 0,
+        "applied_decode_positions": 0,
+    }
+
+    def condition_hook(_module: Any, inputs: Any) -> None:
+        nonlocal condition_calls, gate_triggered
+        condition_calls += 1
+        trace["condition_calls"] = condition_calls
+        if condition_calls != 1:
+            return None
+        hidden = inputs[0]
+        if hidden.ndim != 3 or hidden.shape[0] != 1:
+            raise ValueError("CAST generation currently requires one rank-3 prompt batch")
+        score = cast_condition_similarity(
+            __import__("torch"),
+            hidden[0],
+            condition_direction,
+            comparison_mode=comparison_mode,
+        )
+        numeric_score = float(score.detach().float().cpu())
+        natural_gate = (
+            numeric_score > float(threshold)
+            if comparator == "greater"
+            else numeric_score < float(threshold)
+        )
+        gate_triggered = natural_gate if gate_override is None else bool(gate_override)
+        trace["condition_score"] = numeric_score
+        trace["natural_gate_triggered"] = natural_gate
+        trace["gate_triggered"] = gate_triggered
+        return None
+
+    def behavior_hook(_module: Any, inputs: Any) -> Any:
+        nonlocal behavior_calls
+        is_prefill = behavior_calls == 0
+        behavior_calls += 1
+        if is_prefill:
+            trace["behavior_prefill_calls"] += 1
+        else:
+            trace["behavior_decode_calls"] += 1
+        if gate_triggered is None:
+            raise RuntimeError("CAST behavior layer ran before its condition gate")
+        if not gate_triggered or (not is_prefill and not apply_decode):
+            return None
+        hidden = inputs[0]
+        if hidden.ndim != 3:
+            raise ValueError("CAST behavior input must have shape [batch, tokens, d_model]")
+        modified = hidden.clone()
+        if is_prefill and prefill_mode == "decision_only":
+            modified[:, -1, :] = operator(modified[:, -1, :])
+            applied = int(modified.shape[0])
+        else:
+            modified = operator(modified)
+            applied = int(modified.shape[0] * modified.shape[1])
+        key = "applied_prefill_positions" if is_prefill else "applied_decode_positions"
+        trace[key] += applied
+        return (modified, *inputs[1:])
+
+    condition_handle = blocks[condition_layer].register_forward_pre_hook(condition_hook)
+    behavior_handle = blocks[behavior_layer].register_forward_pre_hook(behavior_hook)
+    try:
+        yield trace
+    finally:
+        behavior_handle.remove()
+        condition_handle.remove()
+
+
+@contextmanager
+def mera_generation_hook(
+    modules: Any,
+    *,
+    layer: int,
+    probe_vector: Any,
+    alpha: float,
+    prefill_mode: str = "all_tokens",
+    apply_decode: bool = True,
+):
+    """Apply MERA's closed-form error reduction at each selected position."""
+    from jlens_causal.baselines import mera_closed_form_delta
+
+    if prefill_mode not in {"all_tokens", "decision_only"}:
+        raise ValueError("MERA prefill_mode must be all_tokens or decision_only")
+    call_index = 0
+    trace: dict[str, Any] = {
+        "layer": int(layer),
+        "alpha": float(alpha),
+        "prefill_mode": prefill_mode,
+        "prefill_calls": 0,
+        "decode_calls": 0,
+        "eligible_prefill_positions": 0,
+        "eligible_decode_positions": 0,
+        "applied_prefill_positions": 0,
+        "applied_decode_positions": 0,
+        "prefill_error_probability_mean": None,
+        "prefill_error_probability_max": None,
+        "decode_error_probability_mean": [],
+        "decode_error_probability_max": [],
+    }
+
+    def hook(_module: Any, _inputs: Any, output: Any) -> Any:
+        nonlocal call_index
+        tensor = output if hasattr(output, "shape") else output[0]
+        is_prefill = call_index == 0
+        call_index += 1
+        call_key = "prefill_calls" if is_prefill else "decode_calls"
+        trace[call_key] += 1
+        if not is_prefill and not apply_decode:
+            return output
+        modified = tensor.clone()
+        if is_prefill and prefill_mode == "decision_only":
+            selected = modified[:, -1:, :]
+        else:
+            selected = modified
+        delta, condition, scores = mera_closed_form_delta(
+            __import__("torch"),
+            selected,
+            probe_vector,
+            alpha=float(alpha),
+        )
+        if is_prefill and prefill_mode == "decision_only":
+            modified[:, -1:, :] = selected + delta
+        else:
+            modified = selected + delta
+        eligible_key = (
+            "eligible_prefill_positions" if is_prefill else "eligible_decode_positions"
+        )
+        applied_key = (
+            "applied_prefill_positions" if is_prefill else "applied_decode_positions"
+        )
+        trace[eligible_key] += int(condition.numel())
+        trace[applied_key] += int(condition.sum().detach().cpu())
+        mean_score = float(scores.mean().detach().float().cpu())
+        max_score = float(scores.max().detach().float().cpu())
+        if is_prefill:
+            trace["prefill_error_probability_mean"] = mean_score
+            trace["prefill_error_probability_max"] = max_score
+        else:
+            trace["decode_error_probability_mean"].append(mean_score)
+            trace["decode_error_probability_max"].append(max_score)
+        return _replace_output(output, modified)
+
+    handle = modules[int(layer)].register_forward_hook(hook)
+    try:
+        yield trace
+    finally:
+        handle.remove()
+
+
+@contextmanager
+def sadi_generation_hooks(
+    modules: Any,
+    *,
+    units_by_layer: dict[int, tuple[int, ...] | list[int]],
+    strength: float,
+    apply_decode: bool = False,
+):
+    """Scale SADI-selected MLP output coordinates at generation decisions.
+
+    The default reproduces the hidden-output intervention in the reference
+    implementation: selected coordinates at the final prompt position are
+    replaced by ``strength * current_activation``.  Applying the same dynamic
+    scaling during autoregressive decode is exposed only as a labelled agent
+    extension.
+    """
+    import torch
+
+    if not units_by_layer:
+        raise ValueError("SADI requires at least one selected unit")
+    if not float(strength) >= 0.0:
+        raise ValueError("SADI strength must be non-negative")
+    normalized: dict[int, tuple[int, ...]] = {}
+    for layer, dimensions in units_by_layer.items():
+        layer = int(layer)
+        values = tuple(int(value) for value in dimensions)
+        if not values or len(values) != len(set(values)) or any(value < 0 for value in values):
+            raise ValueError("SADI unit dimensions must be unique non-negative integers")
+        if layer < 0 or layer >= len(modules):
+            raise ValueError("SADI layer is outside the supplied modules")
+        normalized[layer] = values
+
+    calls = {layer: 0 for layer in normalized}
+    trace: dict[str, Any] = {
+        "strength": float(strength),
+        "apply_decode": bool(apply_decode),
+        "selected_unit_count": sum(len(values) for values in normalized.values()),
+        "units_by_layer": {str(layer): list(values) for layer, values in normalized.items()},
+        "prefill_calls": 0,
+        "decode_calls": 0,
+        "applied_prefill_scalars": 0,
+        "applied_decode_scalars": 0,
+        "mean_absolute_before": [],
+        "mean_absolute_after": [],
+    }
+    handles: list[Any] = []
+
+    def make_hook(layer: int, dimensions: tuple[int, ...]):
+        def hook(_module: Any, _inputs: Any, output: Any) -> Any:
+            tensor = output if hasattr(output, "shape") else output[0]
+            if tensor.ndim != 3:
+                raise ValueError("SADI MLP output must have shape [batch, tokens, d_model]")
+            if dimensions[-1] >= int(tensor.shape[-1]):
+                raise ValueError("SADI selected dimension exceeds the MLP output width")
+            is_prefill = calls[layer] == 0
+            calls[layer] += 1
+            if layer == min(normalized):
+                trace["prefill_calls" if is_prefill else "decode_calls"] += 1
+            if not is_prefill and not apply_decode:
+                return output
+            modified = tensor.clone()
+            index = torch.as_tensor(dimensions, device=tensor.device, dtype=torch.long)
+            before = modified[:, -1, :].index_select(-1, index)
+            after = before * float(strength)
+            modified[:, -1, :].index_copy_(-1, index, after)
+            scalar_count = int(before.numel())
+            key = "applied_prefill_scalars" if is_prefill else "applied_decode_scalars"
+            trace[key] += scalar_count
+            trace["mean_absolute_before"].append(float(before.detach().float().abs().mean().cpu()))
+            trace["mean_absolute_after"].append(float(after.detach().float().abs().mean().cpu()))
+            return _replace_output(output, modified)
+
+        return hook
+
+    try:
+        for layer, dimensions in normalized.items():
+            handles.append(modules[layer].register_forward_hook(make_hook(layer, dimensions)))
+        yield trace
+    finally:
+        for handle in reversed(handles):
+            handle.remove()
+
+
+@contextmanager
+def iti_generation_hooks(
+    output_projections: Any,
+    *,
+    heads_by_layer: dict[int, tuple[tuple[int, Any, float], ...]],
+    num_attention_heads: int,
+    head_dim: int,
+    alpha: float,
+    apply_decode: bool = True,
+):
+    """Add ITI's std-scaled COM directions at attention output heads."""
+    if not heads_by_layer:
+        raise ValueError("ITI requires at least one selected head")
+    if not math.isfinite(float(alpha)):
+        raise ValueError("ITI alpha must be finite")
+    calls = {int(layer): 0 for layer in heads_by_layer}
+    trace: dict[str, Any] = {
+        "alpha": float(alpha),
+        "num_attention_heads": int(num_attention_heads),
+        "head_dim": int(head_dim),
+        "apply_decode": bool(apply_decode),
+        "selected_head_count": sum(len(values) for values in heads_by_layer.values()),
+        "heads_by_layer": {
+            str(layer): [int(head) for head, _direction, _scale in values]
+            for layer, values in heads_by_layer.items()
+        },
+        "prefill_calls": 0,
+        "decode_calls": 0,
+        "applied_prefill_heads": 0,
+        "applied_decode_heads": 0,
+    }
+    handles = []
+    sentinel = min(heads_by_layer)
+
+    def make_hook(layer: int, entries: tuple[tuple[int, Any, float], ...]):
+        def hook(_module: Any, inputs: Any) -> Any:
+            hidden = inputs[0]
+            if hidden.ndim != 3 or int(hidden.shape[-1]) != num_attention_heads * head_dim:
+                raise ValueError("ITI o_proj input has an incompatible attention-head shape")
+            is_prefill = calls[layer] == 0
+            calls[layer] += 1
+            if layer == sentinel:
+                trace["prefill_calls" if is_prefill else "decode_calls"] += 1
+            if not is_prefill and not apply_decode:
+                return None
+            modified = hidden.clone()
+            for head, direction, scale in entries:
+                start = int(head) * head_dim
+                end = start + head_dim
+                vector = direction.to(device=hidden.device, dtype=hidden.dtype)
+                modified[:, -1, start:end] += float(alpha) * float(scale) * vector
+            key = "applied_prefill_heads" if is_prefill else "applied_decode_heads"
+            trace[key] += int(modified.shape[0]) * len(entries)
+            return (modified, *inputs[1:])
+
+        return hook
+
+    try:
+        for layer, entries in heads_by_layer.items():
+            handles.append(
+                output_projections[int(layer)].register_forward_pre_hook(
+                    make_hook(int(layer), entries)
+                )
+            )
+        yield trace
+    finally:
+        for handle in reversed(handles):
+            handle.remove()
+
+
+@contextmanager
+def austeer_generation_hooks(
+    output_projections: Any,
+    *,
+    units_by_layer: dict[int, tuple[tuple[int, float], ...]],
+    alpha: float,
+    prefill_mode: str = "all_tokens",
+    apply_decode: bool = True,
+):
+    """Apply AUSteer's multiplicative signed-consistency mask."""
+    if not units_by_layer or not math.isfinite(float(alpha)):
+        raise ValueError("AUSteer requires units and a finite alpha")
+    if prefill_mode not in {"all_tokens", "decision_only"}:
+        raise ValueError("AUSteer prefill mode must be all_tokens or decision_only")
+    calls = {int(layer): 0 for layer in units_by_layer}
+    sentinel = min(units_by_layer)
+    trace: dict[str, Any] = {
+        "alpha": float(alpha),
+        "prefill_mode": prefill_mode,
+        "apply_decode": bool(apply_decode),
+        "selected_unit_count": sum(len(values) for values in units_by_layer.values()),
+        "prefill_calls": 0,
+        "decode_calls": 0,
+        "applied_prefill_scalars": 0,
+        "applied_decode_scalars": 0,
+    }
+    handles = []
+
+    def make_hook(layer: int, entries: tuple[tuple[int, float], ...]):
+        def hook(_module: Any, inputs: Any) -> Any:
+            import torch
+
+            hidden = inputs[0]
+            if hidden.ndim != 3:
+                raise ValueError("AUSteer attention output must be rank 3")
+            is_prefill = calls[layer] == 0
+            calls[layer] += 1
+            if layer == sentinel:
+                trace["prefill_calls" if is_prefill else "decode_calls"] += 1
+            if not is_prefill and not apply_decode:
+                return None
+            modified = hidden.clone()
+            dimensions = torch.tensor(
+                [dimension for dimension, _beta in entries],
+                dtype=torch.long,
+                device=hidden.device,
+            )
+            betas = torch.tensor(
+                [beta for _dimension, beta in entries],
+                dtype=hidden.dtype,
+                device=hidden.device,
+            )
+            if is_prefill and prefill_mode == "decision_only":
+                selected = modified[:, -1:, :].index_select(-1, dimensions)
+                modified[:, -1:, :].index_copy_(
+                    -1, dimensions, selected * (1.0 + float(alpha) * betas)
+                )
+                positions = int(modified.shape[0])
+            else:
+                selected = modified.index_select(-1, dimensions)
+                modified.index_copy_(
+                    -1, dimensions, selected * (1.0 + float(alpha) * betas)
+                )
+                positions = int(modified.shape[0] * modified.shape[1])
+            key = "applied_prefill_scalars" if is_prefill else "applied_decode_scalars"
+            trace[key] += positions * len(entries)
+            return (modified, *inputs[1:])
+
+        return hook
+
+    try:
+        for layer, entries in units_by_layer.items():
+            handles.append(
+                output_projections[int(layer)].register_forward_pre_hook(
+                    make_hook(int(layer), entries)
+                )
+            )
+        yield trace
+    finally:
+        for handle in reversed(handles):
+            handle.remove()
+
+
+@contextmanager
+def loreft_generation_hooks(
+    blocks: Any,
+    *,
+    parameters_by_layer: dict[int, tuple[Any, Any, Any]],
+    scale: float = 1.0,
+    apply_decode: bool = False,
+):
+    """Apply LoReFT at the final prompt token, its agent-relevant position."""
+    from jlens_causal.baselines import loreft_transform
+
+    if not parameters_by_layer or not math.isfinite(float(scale)):
+        raise ValueError("LoReFT requires parameters and a finite scale")
+    calls = {int(layer): 0 for layer in parameters_by_layer}
+    sentinel = min(parameters_by_layer)
+    trace: dict[str, Any] = {
+        "scale": float(scale),
+        "position": "last_prompt_token",
+        "apply_decode": bool(apply_decode),
+        "layers": sorted(int(layer) for layer in parameters_by_layer),
+        "rank": int(next(iter(parameters_by_layer.values()))[0].shape[1]),
+        "prefill_calls": 0,
+        "decode_calls": 0,
+        "applied_prefill_positions": 0,
+        "applied_decode_positions": 0,
+    }
+    handles = []
+
+    def make_hook(layer: int, values: tuple[Any, Any, Any]):
+        rotate, learned_weight, learned_bias = values
+
+        def hook(_module: Any, _inputs: Any, output: Any) -> Any:
+            tensor = output if hasattr(output, "shape") else output[0]
+            if tensor.ndim != 3:
+                raise ValueError("LoReFT block output must have shape [batch, tokens, d_model]")
+            is_prefill = calls[layer] == 0
+            calls[layer] += 1
+            if layer == sentinel:
+                trace["prefill_calls" if is_prefill else "decode_calls"] += 1
+            if not is_prefill and not apply_decode:
+                return output
+            modified = tensor.clone()
+            modified[:, -1:, :] = loreft_transform(
+                __import__("torch"),
+                modified[:, -1:, :],
+                rotate=rotate,
+                learned_weight=learned_weight,
+                learned_bias=learned_bias,
+                scale=scale,
+            )
+            key = (
+                "applied_prefill_positions" if is_prefill else "applied_decode_positions"
+            )
+            trace[key] += int(modified.shape[0])
+            return _replace_output(output, modified)
+
+        return hook
+
+    try:
+        for layer, values in parameters_by_layer.items():
+            handles.append(blocks[int(layer)].register_forward_hook(make_hook(int(layer), values)))
+        yield trace
+    finally:
+        for handle in reversed(handles):
+            handle.remove()
 
 
 @contextmanager

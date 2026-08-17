@@ -5,6 +5,13 @@ causally move both Jacobian-lens readouts and downstream ToolAlign behavior.
 It is separate from ToolAlignBench and uses its public prompts, tool taxonomy,
 and XML system prompt unchanged.
 
+The complete Core-7 integration (CAA, CAST, MERA, SADI, ITI, AUSteer, and
+LoReFT) and runnable ToolAlign aligned/abliterated plus TauBench Airline Task
+18 protocols are in [STEERING_EXPERIMENTS.md](STEERING_EXPERIMENTS.md).
+
+The generic, remote-only failure-mode protocol that replaces fixed Task-18
+turn selection is in [FAILURE_MODE_STEERING.md](FAILURE_MODE_STEERING.md).
+
 ## Experimental design
 
 The checked-in split uses 12 calibration domains (48 matched document pairs)

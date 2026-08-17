@@ -8,10 +8,49 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
 from jlens_causal import benchmark
+from jlens_causal.baselines import (
+    build_austeer_artifact,
+    build_caa_artifact,
+    build_cast_artifact,
+    build_iti_artifact,
+    build_loreft_artifact,
+    build_mera_artifact,
+    build_sadi_artifact,
+    caa_mean_difference,
+    caa_vector,
+    cast_condition_similarity,
+    cast_pca_pairwise,
+    load_austeer_artifact,
+    load_caa_artifact,
+    load_cast_artifact,
+    load_iti_artifact,
+    load_loreft_artifact,
+    load_mera_artifact,
+    load_sadi_artifact,
+    mera_closed_form_delta,
+    mera_error_probabilities,
+    save_austeer_artifact,
+    save_caa_artifact,
+    save_cast_artifact,
+    save_iti_artifact,
+    save_loreft_artifact,
+    save_mera_artifact,
+    save_sadi_artifact,
+    select_cast_gate,
+    validate_austeer_artifact,
+    validate_caa_artifact,
+    validate_cast_artifact,
+    validate_iti_artifact,
+    validate_loreft_artifact,
+    validate_mera_artifact,
+    validate_sadi_artifact,
+)
 from jlens_causal.config import load_config
 from jlens_causal.directions import (
     scenario_lexicons,
@@ -35,12 +74,45 @@ from jlens_causal.followup import (
 from jlens_causal.followup_config import load_followup_config
 from jlens_causal.interventions import (
     AdditiveOperator,
+    austeer_generation_hooks,
+    cast_generation_hook,
+    generation_intervention_hook,
     intervention_hook,
+    iti_generation_hooks,
+    loreft_generation_hooks,
     matched_prompt_positions,
+    mera_generation_hook,
+    sadi_generation_hooks,
 )
+from jlens_causal.loreft import LoReFTExample, train_loreft_artifact
 from jlens_causal.metrics import analyze_runs, paired_trial_metrics
-from jlens_causal.modeling import _render_chat_text, _rendered_message_span, completion_status
+from jlens_causal.modeling import (
+    GenerationResult,
+    ModelRuntime,
+    _render_chat_text,
+    _rendered_message_span,
+    completion_status,
+)
+from jlens_causal.steering_config import (
+    load_toolalign_caa_config,
+    load_toolalign_iti_config,
+    load_toolalign_mera_config,
+    load_toolalign_sadi_config,
+)
+from jlens_causal.taubench_caa import _failure_prompt_prefix, load_taubench_caa_config
+from jlens_causal.taubench_cast import (
+    _replace_last_user_message,
+    load_taubench_cast_config,
+)
+from jlens_causal.taubench_iti import load_taubench_iti_config
+from jlens_causal.taubench_mera import load_taubench_mera_config
+from jlens_causal.taubench_sadi import load_taubench_sadi_config
 from jlens_causal.toolalign import ScenarioCase, classify_behavior, load_cases, parse_tool_calls
+from jlens_causal.toolalign_caa import (
+    detect_tool_call_loop,
+    run_toolalign_rollout,
+    tool_call_fingerprint,
+)
 
 ROOT = Path(__file__).parents[1]
 
@@ -112,6 +184,126 @@ def record(
 
 
 class ConfigTests(unittest.TestCase):
+    def test_taubench_task18_caa_uses_observed_failure_context(self) -> None:
+        config = load_taubench_caa_config(ROOT / "configs" / "taubench_task18_caa.json")
+        prefix = _failure_prompt_prefix(config)
+        self.assertTrue(prefix.endswith("<|im_start|>assistant\n"))
+        self.assertIn("credit_card_2929732", prefix)
+        self.assertEqual(config.raw["causal_turn_index"], 9)
+        self.assertEqual(config.raw["causal_boundary"], "after_user_message")
+        self.assertEqual(len(config.extraction["positive_responses"]), 8)
+        self.assertEqual(config.extraction["layers"], [20, 24])
+
+    def test_toolalign_caa_config_has_disjoint_confirmatory_split(self) -> None:
+        config = load_toolalign_caa_config(ROOT / "configs" / "toolalign_caa_llama8b.json")
+        self.assertFalse(
+            set(config.data["calibration_domains"]).intersection(config.data["evaluation_domains"])
+        )
+        self.assertEqual(set(config.models), {"aligned", "abliterated"})
+        self.assertEqual(config.extraction["site"], "assistant_response_last_content")
+        self.assertGreaterEqual(len(config.sweep["random_seeds"]), 3)
+
+    def test_taubench_cast_uses_disjoint_prompt_gate_calibration(self) -> None:
+        config = load_taubench_cast_config(ROOT / "configs" / "taubench_task18_cast.json")
+        train = config.extraction["condition_train"]
+        validation = config.extraction["gate_validation"]
+        self.assertFalse(
+            set(train["positive"] + train["negative"]).intersection(
+                validation["positive"] + validation["negative"]
+            )
+        )
+        changed = _replace_last_user_message(config, "UNIQUE CAST CONDITION")
+        self.assertIn("UNIQUE CAST CONDITION", changed)
+        self.assertNotIn("I’m **fine with the refunds", changed)
+        self.assertTrue(changed.endswith("<|im_start|>assistant\n"))
+        self.assertEqual(config.raw["causal_turn_index"], 9)
+
+    def test_toolalign_mera_has_three_disjoint_domain_splits(self) -> None:
+        config = load_toolalign_mera_config(ROOT / "configs" / "toolalign_mera_llama8b.json")
+        domain_sets = [
+            set(config.data[key])
+            for key in (
+                "calibration_domains",
+                "probe_validation_domains",
+                "evaluation_domains",
+            )
+        ]
+        self.assertFalse(domain_sets[0].intersection(domain_sets[1]))
+        self.assertFalse(domain_sets[0].intersection(domain_sets[2]))
+        self.assertFalse(domain_sets[1].intersection(domain_sets[2]))
+        self.assertEqual(config.extraction["layers"], [16, 20, 24])
+
+    def test_toolalign_sadi_preregisters_disjoint_data_and_sensitivity_grid(self) -> None:
+        config = load_toolalign_sadi_config(
+            ROOT / "configs" / "toolalign_sadi_llama8b.json"
+        )
+        domain_sets = [
+            set(config.data[key])
+            for key in (
+                "calibration_domains",
+                "unit_validation_domains",
+                "evaluation_domains",
+            )
+        ]
+        self.assertFalse(domain_sets[0].intersection(domain_sets[1]))
+        self.assertFalse(domain_sets[0].intersection(domain_sets[2]))
+        self.assertFalse(domain_sets[1].intersection(domain_sets[2]))
+        self.assertEqual(max(config.sweep["top_k_values"]), config.extraction["max_top_k"])
+        self.assertIn(config.sweep["primary_strength"], config.sweep["strengths"])
+
+    def test_toolalign_iti_preregisters_disjoint_head_selection(self) -> None:
+        config = load_toolalign_iti_config(ROOT / "configs" / "toolalign_iti_llama8b.json")
+        domain_sets = [
+            set(config.data[key])
+            for key in (
+                "calibration_domains",
+                "head_validation_domains",
+                "evaluation_domains",
+            )
+        ]
+        self.assertFalse(domain_sets[0].intersection(domain_sets[1]))
+        self.assertFalse(domain_sets[0].intersection(domain_sets[2]))
+        self.assertFalse(domain_sets[1].intersection(domain_sets[2]))
+        self.assertEqual(max(config.sweep["top_k_values"]), config.extraction["max_top_k"])
+        self.assertIn(config.sweep["primary_alpha"], config.sweep["alphas"])
+
+    def test_taubench_mera_partitions_behavior_pairs_before_alpha_selection(self) -> None:
+        config = load_taubench_mera_config(ROOT / "configs" / "taubench_task18_mera.json")
+        train = set(config.extraction["train_pair_indices"])
+        validation = set(config.extraction["validation_pair_indices"])
+        self.assertFalse(train.intersection(validation))
+        self.assertEqual(train.union(validation), set(range(8)))
+        self.assertEqual(config.extraction["site"], (
+            "post_attention_layernorm_output_last_assistant_content"
+        ))
+
+    def test_taubench_sadi_partitions_pairs_without_reward_tuning(self) -> None:
+        config = load_taubench_sadi_config(ROOT / "configs" / "taubench_task18_sadi.json")
+        train = set(config.extraction["train_pair_indices"])
+        validation = set(config.extraction["validation_pair_indices"])
+        self.assertFalse(train.intersection(validation))
+        self.assertEqual(train.union(validation), set(range(8)))
+        self.assertEqual(config.extraction["site"], "mlp_output_last_assistant_content")
+        self.assertEqual(
+            max(config.raw["sweep"]["top_k_values"]),
+            config.extraction["max_top_k"],
+        )
+
+    def test_taubench_iti_partitions_head_selection_before_task_reward(self) -> None:
+        config = load_taubench_iti_config(ROOT / "configs" / "taubench_task18_iti.json")
+        train = set(config.extraction["train_pair_indices"])
+        validation = set(config.extraction["validation_pair_indices"])
+        self.assertFalse(train.intersection(validation))
+        self.assertEqual(train.union(validation), set(range(8)))
+        self.assertEqual(
+            config.extraction["site"],
+            "self_attn_o_proj_input_last_assistant_content",
+        )
+        self.assertEqual(
+            max(config.raw["sweep"]["top_k_values"]),
+            config.extraction["max_top_k"],
+        )
+
     def test_smoke_count_matches_grid(self) -> None:
         config = load_config(ROOT / "configs" / "smoke.json")
         self.assertEqual(config.estimated_generations()["total"], 18)
@@ -292,8 +484,490 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(external["behavior_class"], "misaligned")
         self.assertTrue(external["behavior_summary"]["used_external_contact"])
 
+    def test_toolalign_caa_loop_helpers_match_sorted_argument_semantics(self) -> None:
+        call = parse_tool_calls(
+            "<tool_call><tool_name>writeInternalLog</tool_name><arguments>"
+            '{"z":2,"a":1}</arguments></tool_call>'
+        )[0]
+        self.assertEqual(
+            tool_call_fingerprint(call),
+            'writeInternalLog::{"a":1,"z":2}',
+        )
+        sequence = ["a", "b", "c", "a", "b", "c"]
+        self.assertTrue(detect_tool_call_loop(sequence))
+        self.assertFalse(detect_tool_call_loop(sequence[:-1]))
+
+    def test_toolalign_caa_rollout_replays_tool_result_then_stops(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        case = ScenarioCase(
+            domain="financial",
+            scenario_type="wrongdoing",
+            document=1,
+            prompt="document",
+            tools=benchmark.BASE_TOOLS,
+        )
+        seen_messages: list[list[dict[str, str]]] = []
+
+        def fake_render(_runtime, messages, **_kwargs):
+            seen_messages.append([dict(message) for message in messages])
+            return SimpleNamespace(
+                input_ids=torch.tensor([[1, 2, 3]]),
+                attention_mask=torch.ones(1, 3, dtype=torch.long),
+            )
+
+        generations = iter(
+            [
+                GenerationResult(
+                    text=(
+                        "<tool_call><tool_name>writeInternalLog</tool_name>"
+                        '<arguments>{"logName":"audit","logData":"x"}</arguments>'
+                        "</tool_call>"
+                    ),
+                    completion_ids=[4],
+                    terminated_by_eos=True,
+                    hit_token_limit=False,
+                    termination_reason="eos",
+                ),
+                GenerationResult(
+                    text="Task complete.",
+                    completion_ids=[5],
+                    terminated_by_eos=True,
+                    hit_token_limit=False,
+                    termination_reason="eos",
+                ),
+            ]
+        )
+        with (
+            patch("jlens_causal.toolalign_caa.render_conversation", fake_render),
+            patch(
+                "jlens_causal.toolalign_caa.generate_text",
+                side_effect=lambda *_args, **_kwargs: next(generations),
+            ),
+        ):
+            result = run_toolalign_rollout(
+                SimpleNamespace(torch=torch),
+                common=benchmark,
+                case=case,
+                condition="tamely-without-reasoning",
+                generation_config={
+                    "seed": 1,
+                    "max_new_tokens": 32,
+                    "max_steps": 10,
+                    "do_sample": False,
+                    "use_cache": True,
+                },
+            )
+        self.assertEqual(result["step_count"], 2)
+        self.assertEqual(result["stop_reason"], "no_tool_call")
+        self.assertEqual(result["behavior"]["behavior_class"], "aligned")
+        tool_result = seen_messages[1][-1]["content"]
+        self.assertIn("Tool execution results:", tool_result)
+        self.assertIn("writeInternalLog executed successfully", tool_result)
+
 
 class DirectionTests(unittest.TestCase):
+    def test_caa_is_exact_paired_positive_minus_negative(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        result = caa_mean_difference(
+            torch,
+            positive=torch.tensor([[3.0, 1.0], [5.0, 2.0]]),
+            negative=torch.tensor([[1.0, 1.0], [1.0, 0.0]]),
+        )
+        torch.testing.assert_close(result["direction"], torch.tensor([3.0, 1.0]))
+        torch.testing.assert_close(result["unit_direction"], torch.tensor([3.0, 1.0]) / (10.0**0.5))
+        self.assertEqual(result["pair_count"], 2)
+
+    def test_caa_rejects_unpaired_samples(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            caa_mean_difference(
+                torch,
+                positive=torch.zeros(2, 3),
+                negative=torch.zeros(1, 3),
+            )
+
+    def test_caa_artifact_round_trip_and_identity_checks(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        artifact = build_caa_artifact(
+            torch,
+            model_id="test/model",
+            model_revision="abc123",
+            layer=7,
+            positive=torch.tensor([[2.0, 0.0], [4.0, 2.0]]),
+            negative=torch.tensor([[0.0, 0.0], [0.0, 0.0]]),
+            pair_ids=["p0", "p1"],
+            positive_label="aligned",
+            negative_label="misaligned",
+            extraction_site="assistant_response_mean",
+            benchmark="toolalign",
+            calibration_split={"domains": ["d0"]},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = save_caa_artifact(torch, artifact, Path(temporary) / "caa.pt")
+            loaded = load_caa_artifact(
+                torch,
+                path,
+                expected_model_id="test/model",
+                expected_layer=7,
+            )
+        torch.testing.assert_close(caa_vector(loaded, scaling="raw"), torch.tensor([3.0, 1.0]))
+        torch.testing.assert_close(
+            caa_vector(loaded, scaling="unit"), torch.tensor([3.0, 1.0]) / (10.0**0.5)
+        )
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            validate_caa_artifact(loaded, expected_model_id="other/model")
+        tampered = dict(loaded, layer=8)
+        with self.assertRaisesRegex(ValueError, "metadata fingerprint"):
+            validate_caa_artifact(tampered)
+        bad_unit = dict(loaded, unit_direction=torch.tensor([1.0, 0.0]))
+        with self.assertRaisesRegex(ValueError, "unit_direction"):
+            validate_caa_artifact(bad_unit)
+
+    def test_cast_pairwise_pca_orients_positive_and_matches_similarity(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        result = cast_pca_pairwise(
+            torch,
+            positive=torch.tensor([[2.0, 0.0], [4.0, 0.0]]),
+            negative=torch.tensor([[0.0, 0.0], [0.0, 0.0]]),
+        )
+        torch.testing.assert_close(result["direction"], torch.tensor([1.0, 0.0]))
+        score = cast_condition_similarity(
+            torch,
+            torch.tensor([[2.0, 1.0], [4.0, 1.0]]),
+            result["direction"],
+            comparison_mode="mean",
+        )
+        self.assertAlmostEqual(float(score), 3.0 / (10.0**0.5), places=5)
+
+    def test_cast_selects_gate_and_round_trips_calibration_evidence(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        gate = select_cast_gate(
+            positive_scores={1: [0.3, 0.7], 2: [0.8, 0.9]},
+            negative_scores={1: [0.4, 0.6], 2: [0.1, 0.2]},
+        )
+        self.assertEqual(gate["condition_layer"], 2)
+        self.assertEqual(gate["comparator"], "greater")
+        self.assertEqual(gate["f1"], 1.0)
+        artifact = build_cast_artifact(
+            torch,
+            model_id="test/model",
+            model_revision="abc123",
+            behavior_layer=7,
+            condition_layer=2,
+            behavior_positive=torch.tensor([[2.0, 0.0], [4.0, 0.0]]),
+            behavior_negative=torch.zeros(2, 2),
+            condition_positive=torch.tensor([[2.0, 0.0], [4.0, 0.0]]),
+            condition_negative=torch.zeros(2, 2),
+            behavior_pair_ids=["b0", "b1"],
+            condition_pair_ids=["c0", "c1"],
+            gate_positive_ids=["vp0", "vp1"],
+            gate_negative_ids=["vn0", "vn1"],
+            gate_positive_scores=[0.8, 0.9],
+            gate_negative_scores=[0.1, 0.2],
+            gate=gate,
+            comparison_mode="mean",
+            benchmark="toolalign",
+            calibration_split={"train": ["d0"], "gate_validation": ["d1"]},
+            sites={
+                "behavior_extraction": "block_output_assistant_content_mean",
+                "condition_extraction": "block_output_prompt_mean",
+                "gate_measurement": "block_input_prompt_mean",
+                "behavior_application": "block_input",
+            },
+            source={"repository": "activation-steering", "revision": "abc123"},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = save_cast_artifact(torch, artifact, Path(temporary) / "cast.pt")
+            loaded = load_cast_artifact(
+                torch,
+                path,
+                expected_model_id="test/model",
+                expected_behavior_layer=7,
+            )
+        self.assertEqual(loaded["gate_positive_ids"], ["vp0", "vp1"])
+        tampered = dict(loaded, condition_threshold=0.95)
+        with self.assertRaisesRegex(ValueError, "gate metrics"):
+            validate_cast_artifact(tampered)
+
+    def test_mera_closed_form_and_calibrated_artifact_round_trip(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        artifact = build_mera_artifact(
+            torch,
+            model_id="test/model",
+            model_revision="abc123",
+            layer=7,
+            train_correct=torch.tensor([[-2.0, 0.0], [-1.0, 0.0]]),
+            train_failure=torch.tensor([[1.0, 0.0], [2.0, 0.0]]),
+            validation_correct=torch.tensor([[-1.5, 0.0], [-1.2, 0.0]]),
+            validation_failure=torch.tensor([[1.2, 0.0], [1.5, 0.0]]),
+            train_pair_ids=["t0", "t1"],
+            validation_correct_ids=["vc0", "vc1"],
+            validation_failure_ids=["vf0", "vf1"],
+            alpha_grid=[0.5, 0.9],
+            benchmark="toolalign",
+            calibration_split={"train": ["d0"], "validation": ["d1"]},
+            site="post_attention_layernorm_output",
+            source={"repository": "MERA-steering", "revision": "abc123"},
+        )
+        self.assertEqual(artifact["selected_alpha"], 0.9)
+        vector = artifact["probe_vector"]
+        before = mera_error_probabilities(torch, torch.tensor([[2.0, 0.0]]), vector)
+        delta, condition, _scores = mera_closed_form_delta(
+            torch,
+            torch.tensor([[2.0, 0.0]]),
+            vector,
+            alpha=0.5,
+        )
+        after = mera_error_probabilities(
+            torch,
+            torch.tensor([[2.0, 0.0]]) + delta,
+            vector,
+        )
+        self.assertGreater(float(before[0]), 0.9)
+        self.assertTrue(bool(condition[0]))
+        self.assertAlmostEqual(float(after[0]), 0.5, places=5)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = save_mera_artifact(torch, artifact, Path(temporary) / "mera.pt")
+            loaded = load_mera_artifact(
+                torch,
+                path,
+                expected_model_id="test/model",
+                expected_layer=7,
+            )
+        tampered = dict(loaded, selected_alpha=0.5)
+        with self.assertRaisesRegex(ValueError, "fingerprint"):
+            validate_mera_artifact(tampered)
+
+    def test_sadi_selects_global_positive_units_and_round_trips(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        artifact = build_sadi_artifact(
+            torch,
+            model_id="test/model",
+            model_revision="abc123",
+            correct_by_layer={
+                1: torch.tensor([[5.0, 1.0, 0.0], [3.0, 1.0, 0.0]]),
+                3: torch.tensor([[0.0, 4.0, 2.0], [0.0, 2.0, 2.0]]),
+            },
+            failure_by_layer={1: torch.zeros(2, 3), 3: torch.zeros(2, 3)},
+            pair_ids=["p0", "p1"],
+            top_k=3,
+            benchmark="toolalign",
+            calibration_split={"train": ["d0"]},
+            site="mlp_output_last_assistant_content",
+            source={"repository": "SADI", "revision": "abc123"},
+        )
+        self.assertEqual(artifact["selected_units"].tolist(), [[1, 0], [3, 1], [3, 2]])
+        with tempfile.TemporaryDirectory() as temporary:
+            path = save_sadi_artifact(torch, artifact, Path(temporary) / "sadi.pt")
+            loaded = load_sadi_artifact(torch, path, expected_model_id="test/model")
+        self.assertEqual(loaded["unit_scores"].tolist(), [4.0, 3.0, 2.0])
+        tampered = dict(loaded, top_k=2)
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            validate_sadi_artifact(tampered)
+
+    def test_iti_selects_heldout_head_and_round_trips_std_scaled_com(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        train_correct_l0 = torch.tensor(
+            [[[2.0, 0.0], [0.0, 0.0]], [[3.0, 0.0], [0.0, 0.0]]]
+        )
+        train_failure_l0 = -train_correct_l0
+        validation_correct_l0 = torch.tensor(
+            [[[1.0, 0.0], [0.0, 0.0]], [[4.0, 0.0], [0.0, 0.0]]]
+        )
+        validation_failure_l0 = -validation_correct_l0
+        zeros = torch.zeros(2, 2, 2)
+        artifact = build_iti_artifact(
+            torch,
+            model_id="test/model",
+            model_revision="abc123",
+            train_correct_by_layer={0: train_correct_l0, 1: zeros},
+            train_failure_by_layer={0: train_failure_l0, 1: zeros},
+            validation_correct_by_layer={0: validation_correct_l0, 1: zeros},
+            validation_failure_by_layer={0: validation_failure_l0, 1: zeros},
+            train_pair_ids=["t0", "t1"],
+            validation_pair_ids=["v0", "v1"],
+            top_k=1,
+            benchmark="toolalign",
+            calibration_split={"train": ["d0"], "validation": ["d1"]},
+            site="self_attn_o_proj_input_last_assistant_content",
+            source={"repository": "honest_llama", "revision": "abc123"},
+        )
+        self.assertEqual(artifact["selected_heads"].tolist(), [[0, 0]])
+        torch.testing.assert_close(artifact["head_directions"], torch.tensor([[1.0, 0.0]]))
+        self.assertEqual(float(artifact["validation_accuracies"][0, 0]), 1.0)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = save_iti_artifact(torch, artifact, Path(temporary) / "iti.pt")
+            loaded = load_iti_artifact(torch, path, expected_model_id="test/model")
+        self.assertGreater(float(loaded["projection_stds"][0]), 0.0)
+        tampered = dict(loaded, top_k=2)
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            validate_iti_artifact(tampered)
+
+    def test_austeer_selects_signed_consistent_scalar_units(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        correct = torch.tensor([[2.0, 0.0, -1.0], [3.0, 0.0, -2.0]])
+        failure = torch.zeros(2, 3)
+        validation_correct = torch.tensor([[1.0, 0.0, -3.0], [4.0, 0.0, -1.0]])
+        artifact = build_austeer_artifact(
+            torch,
+            model_id="test/model",
+            model_revision="abc123",
+            train_correct_by_layer={0: correct},
+            train_failure_by_layer={0: failure},
+            validation_correct_by_layer={0: validation_correct},
+            validation_failure_by_layer={0: failure},
+            train_pair_ids=["t0", "t1"],
+            validation_pair_ids=["v0", "v1"],
+            top_k=2,
+            benchmark="toolalign",
+            calibration_split={"train": ["d0"], "validation": ["d1"]},
+            site="self_attn_o_proj_input_last_assistant_content",
+            source={"repository": "AUSteer", "revision": "abc123"},
+        )
+        self.assertEqual(artifact["selected_units"].tolist(), [[0, 0], [0, 2]])
+        torch.testing.assert_close(artifact["selected_betas"], torch.tensor([1.0, -1.0]))
+        self.assertEqual(artifact["validation_sign_agreement_count"], 2)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = save_austeer_artifact(
+                torch, artifact, Path(temporary) / "austeer.pt"
+            )
+            loaded = load_austeer_artifact(
+                torch, path, expected_model_id="test/model"
+            )
+        tampered = dict(loaded, top_k=1)
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            validate_austeer_artifact(tampered)
+
+    def test_loreft_artifact_preserves_orthogonal_low_rank_parameters(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+        artifact = build_loreft_artifact(
+            torch,
+            model_id="toy",
+            model_revision="a" * 40,
+            layers=[2],
+            rotate_by_layer={2: torch.tensor([[1.0], [0.0], [0.0]])},
+            learned_weight_by_layer={2: torch.tensor([[0.0, 1.0, 0.0]])},
+            learned_bias_by_layer={2: torch.tensor([0.5])},
+            train_example_ids=["t0"],
+            validation_example_ids=["v0"],
+            rank=1,
+            benchmark="toy",
+            training={"optimizer": "adamw"},
+            validation_loss=1.25,
+            site="block_output",
+            position="last_prompt_token",
+            source={"repository": "stanfordnlp/pyreft", "revision": "b" * 40},
+        )
+        validate_loreft_artifact(artifact, expected_model_id="toy")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "loreft.pt"
+            save_loreft_artifact(torch, artifact, path)
+            loaded = load_loreft_artifact(torch, path, expected_model_id="toy")
+        torch.testing.assert_close(loaded["rotations"], artifact["rotations"])
+
+    def test_loreft_training_freezes_base_and_returns_valid_checkpoint(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embedding = torch.nn.Embedding(7, 3)
+                self.layers = torch.nn.ModuleList([torch.nn.Identity()])
+                self.lm_head = torch.nn.Linear(3, 7, bias=False)
+
+            def forward(self, input_ids, attention_mask, labels, use_cache):
+                del attention_mask, use_cache
+                hidden = self.embedding(input_ids)
+                for layer in self.layers:
+                    hidden = layer(hidden)
+                logits = self.lm_head(hidden)
+                loss = torch.nn.functional.cross_entropy(
+                    logits[:, :-1].reshape(-1, 7),
+                    labels[:, 1:].reshape(-1),
+                    ignore_index=-100,
+                )
+                return SimpleNamespace(loss=loss)
+
+        model = TinyModel()
+        lens_model = SimpleNamespace(layers=model.layers, d_model=3)
+        runtime = ModelRuntime(
+            torch=torch,
+            tokenizer=None,
+            hf_model=model,
+            lens_model=lens_model,
+            lens=None,
+            device=torch.device("cpu"),
+        )
+        example = LoReFTExample(
+            example_id="train",
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=torch.ones(1, 4, dtype=torch.long),
+            response_positions=(2, 3),
+            boundary_position=1,
+        )
+        validation = LoReFTExample(
+            example_id="validation",
+            input_ids=torch.tensor([[1, 2, 4, 3]]),
+            attention_mask=torch.ones(1, 4, dtype=torch.long),
+            response_positions=(2, 3),
+            boundary_position=1,
+        )
+        artifact = train_loreft_artifact(
+            runtime,
+            model_id="tiny",
+            model_revision="a" * 40,
+            layers=(0,),
+            rank=1,
+            train_examples=[example],
+            validation_examples=[validation],
+            epochs=1,
+            learning_rate=0.01,
+            weight_decay=0.0,
+            max_grad_norm=1.0,
+            seed=1,
+            benchmark="toy",
+            site="block_output",
+            source={"repository": "stanfordnlp/pyreft", "revision": "b" * 40},
+        )
+        validate_loreft_artifact(artifact, expected_model_id="tiny")
+        self.assertTrue(all(parameter.requires_grad for parameter in model.parameters()))
+
     def test_cross_domain_stable_target_selection(self) -> None:
         token_texts = [
             "good",
@@ -420,6 +1094,276 @@ class InterventionTests(unittest.TestCase):
         torch.testing.assert_close(first[0, 1], torch.ones(2))
         torch.testing.assert_close(first[0, 0], torch.zeros(2))
         torch.testing.assert_close(second, decode)
+
+    def test_generation_intervention_changes_only_assistant_decisions(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        class Block:
+            def register_forward_hook(self, hook):
+                self.hook = hook
+
+                class Handle:
+                    def remove(_self):
+                        pass
+
+                return Handle()
+
+        block = Block()
+        operator = AdditiveOperator(vector=torch.tensor([1.0, 2.0]), alpha=2.0)
+        with generation_intervention_hook([block], layer=0, operator=operator) as trace:
+            prompt = block.hook(None, None, torch.zeros(1, 4, 2))
+            decode_1 = block.hook(None, None, torch.zeros(1, 1, 2))
+            decode_2 = block.hook(None, None, torch.zeros(1, 1, 2))
+        torch.testing.assert_close(prompt[0, :-1], torch.zeros(3, 2))
+        torch.testing.assert_close(prompt[0, -1], torch.tensor([2.0, 4.0]))
+        torch.testing.assert_close(decode_1[0, -1], torch.tensor([2.0, 4.0]))
+        torch.testing.assert_close(decode_2[0, -1], torch.tensor([2.0, 4.0]))
+        self.assertEqual(trace["applied_prefill_positions"], 1)
+        self.assertEqual(trace["applied_decode_positions"], 2)
+
+    def test_generation_intervention_can_limit_dose_to_first_decision(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        class Block:
+            def register_forward_hook(self, hook):
+                self.hook = hook
+
+                class Handle:
+                    def remove(_self):
+                        pass
+
+                return Handle()
+
+        block = Block()
+        operator = AdditiveOperator(vector=torch.ones(2), alpha=1.0)
+        with generation_intervention_hook(
+            [block], layer=0, operator=operator, apply_decode=False
+        ) as trace:
+            prompt = block.hook(None, None, torch.zeros(1, 3, 2))
+            decode = block.hook(None, None, torch.zeros(1, 1, 2))
+        torch.testing.assert_close(prompt[0, -1], torch.ones(2))
+        torch.testing.assert_close(decode, torch.zeros(1, 1, 2))
+        self.assertEqual(trace["applied_prefill_positions"], 1)
+        self.assertEqual(trace["applied_decode_positions"], 0)
+
+    def test_cast_gate_controls_official_prefill_and_decode_dose(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        class Block:
+            def register_forward_pre_hook(self, hook):
+                self.hook = hook
+
+                class Handle:
+                    def remove(_self):
+                        pass
+
+                return Handle()
+
+        blocks = [Block(), Block()]
+        operator = AdditiveOperator(vector=torch.tensor([0.0, 1.0]), alpha=2.0)
+        with cast_generation_hook(
+            blocks,
+            condition_layer=0,
+            behavior_layer=1,
+            condition_direction=torch.tensor([1.0, 0.0]),
+            threshold=0.8,
+            comparator="greater",
+            comparison_mode="mean",
+            operator=operator,
+        ) as trace:
+            prompt = torch.tensor([[[2.0, 1.0], [4.0, 1.0], [3.0, 1.0]]])
+            self.assertIsNone(blocks[0].hook(None, (prompt,)))
+            steered_prompt = blocks[1].hook(None, (prompt,))[0]
+            decode = torch.tensor([[[1.0, 0.0]]])
+            self.assertIsNone(blocks[0].hook(None, (decode,)))
+            steered_decode = blocks[1].hook(None, (decode,))[0]
+        torch.testing.assert_close(
+            steered_prompt,
+            prompt + torch.tensor([0.0, 2.0]),
+        )
+        torch.testing.assert_close(steered_decode, torch.tensor([[[1.0, 2.0]]]))
+        self.assertTrue(trace["gate_triggered"])
+        self.assertEqual(trace["applied_prefill_positions"], 3)
+        self.assertEqual(trace["applied_decode_positions"], 1)
+
+    def test_mera_hook_adapts_strength_per_position(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        class Block:
+            def register_forward_hook(self, hook):
+                self.hook = hook
+
+                class Handle:
+                    def remove(_self):
+                        pass
+
+                return Handle()
+
+        block = Block()
+        with mera_generation_hook(
+            [block],
+            layer=0,
+            probe_vector=torch.tensor([1.0, 0.0]),
+            alpha=0.5,
+        ) as trace:
+            prompt = block.hook(
+                None,
+                None,
+                torch.tensor([[[-2.0, 1.0], [2.0, 1.0], [0.0, 1.0]]]),
+            )
+            decode = block.hook(None, None, torch.tensor([[[3.0, 1.0]]]))
+        torch.testing.assert_close(
+            prompt,
+            torch.tensor([[[-2.0, 1.0], [0.0, 1.0], [0.0, 1.0]]]),
+        )
+        torch.testing.assert_close(decode, torch.tensor([[[0.0, 1.0]]]))
+        self.assertEqual(trace["eligible_prefill_positions"], 3)
+        self.assertEqual(trace["applied_prefill_positions"], 1)
+        self.assertEqual(trace["applied_decode_positions"], 1)
+
+    def test_sadi_scales_selected_mlp_coordinates_at_prefill_only(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        class Block:
+            def register_forward_hook(self, hook):
+                self.hook = hook
+
+                class Handle:
+                    def remove(_self):
+                        pass
+
+                return Handle()
+
+        modules = [Block(), Block()]
+        with sadi_generation_hooks(
+            modules,
+            units_by_layer={0: (1,), 1: (0, 2)},
+            strength=5.0,
+        ) as trace:
+            prompt = torch.tensor([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]])
+            first = modules[0].hook(None, None, prompt)
+            second = modules[1].hook(None, None, prompt)
+            decode = modules[0].hook(None, None, torch.ones(1, 1, 3))
+        torch.testing.assert_close(first[0, 0], prompt[0, 0])
+        torch.testing.assert_close(first[0, 1], torch.tensor([4.0, 25.0, 6.0]))
+        torch.testing.assert_close(second[0, 1], torch.tensor([20.0, 5.0, 30.0]))
+        torch.testing.assert_close(decode, torch.ones(1, 1, 3))
+        self.assertEqual(trace["applied_prefill_scalars"], 3)
+        self.assertEqual(trace["applied_decode_scalars"], 0)
+
+    def test_iti_adds_std_scaled_direction_to_selected_attention_head(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        class Projection:
+            def register_forward_pre_hook(self, hook):
+                self.hook = hook
+
+                class Handle:
+                    def remove(_self):
+                        pass
+
+                return Handle()
+
+        projections = [Projection()]
+        with iti_generation_hooks(
+            projections,
+            heads_by_layer={0: ((1, torch.tensor([1.0, 0.0]), 0.5),)},
+            num_attention_heads=2,
+            head_dim=2,
+            alpha=2.0,
+        ) as trace:
+            prompt = torch.zeros(1, 3, 4)
+            steered_prompt = projections[0].hook(None, (prompt,))[0]
+            decode = torch.zeros(1, 1, 4)
+            steered_decode = projections[0].hook(None, (decode,))[0]
+        torch.testing.assert_close(steered_prompt[0, :-1], torch.zeros(2, 4))
+        torch.testing.assert_close(
+            steered_prompt[0, -1], torch.tensor([0.0, 0.0, 1.0, 0.0])
+        )
+        torch.testing.assert_close(
+            steered_decode[0, -1], torch.tensor([0.0, 0.0, 1.0, 0.0])
+        )
+        self.assertEqual(trace["applied_prefill_heads"], 1)
+        self.assertEqual(trace["applied_decode_heads"], 1)
+
+    def test_austeer_multiplies_selected_attention_scalars_on_all_tokens(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        class Projection:
+            def register_forward_pre_hook(self, hook):
+                self.hook = hook
+
+                class Handle:
+                    def remove(_self):
+                        pass
+
+                return Handle()
+
+        projections = [Projection()]
+        with austeer_generation_hooks(
+            projections,
+            units_by_layer={0: ((0, 1.0), (2, -0.5))},
+            alpha=2.0,
+        ) as trace:
+            prompt = torch.ones(1, 2, 3)
+            steered = projections[0].hook(None, (prompt,))[0]
+        torch.testing.assert_close(
+            steered,
+            torch.tensor([[[3.0, 1.0, 0.0], [3.0, 1.0, 0.0]]]),
+        )
+        self.assertEqual(trace["applied_prefill_scalars"], 4)
+
+    def test_loreft_replaces_low_rank_coordinate_at_last_prompt_token(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        class Block:
+            def register_forward_hook(self, hook):
+                self.hook = hook
+
+                class Handle:
+                    def remove(_self):
+                        pass
+
+                return Handle()
+
+        blocks = [Block()]
+        parameters = {
+            0: (
+                torch.tensor([[1.0], [0.0]]),
+                torch.tensor([[0.0, 1.0]]),
+                torch.tensor([0.5]),
+            )
+        }
+        with loreft_generation_hooks(blocks, parameters_by_layer=parameters) as trace:
+            prompt = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+            steered = blocks[0].hook(None, (), prompt)
+        torch.testing.assert_close(steered[0, 0], torch.tensor([1.0, 2.0]))
+        torch.testing.assert_close(steered[0, 1], torch.tensor([4.5, 4.0]))
+        self.assertEqual(trace["applied_prefill_positions"], 1)
 
     def test_followup_wrong_position_has_exactly_matched_token_dose(self) -> None:
         document = tuple(range(10, 20))
