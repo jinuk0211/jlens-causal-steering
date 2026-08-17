@@ -102,7 +102,13 @@ def load_failure_steering_manifest(path: str | Path) -> FailureSteeringManifest:
         ).resolve()
         if not tool_schema_path.is_file():
             raise FileNotFoundError(f"tool schema file is missing: {tool_schema_path}")
-        actual_sha256 = hashlib.sha256(tool_schema_path.read_bytes()).hexdigest()
+        try:
+            tool_schema_value = json.loads(tool_schema_path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("tool schema must be valid UTF-8 JSON") from error
+        # Fingerprint the JSON value rather than platform-specific file bytes.
+        # Git checks out text with LF on Linux and may use CRLF on Windows.
+        actual_sha256 = _fingerprint(tool_schema_value)
         if actual_sha256 != expected_sha256:
             raise ValueError("tool schema sha256 does not match the pinned manifest")
 

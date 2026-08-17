@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -99,3 +100,37 @@ def test_manifest_rejects_split_leakage_and_fixed_turns(tmp_path):
     ] = [9]
     with pytest.raises(ValueError, match="may not hard-code"):
         load_failure_steering_manifest(_write(tmp_path, value))
+
+
+def test_tool_schema_fingerprint_is_independent_of_line_endings(tmp_path):
+    schema = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+        }
+    ]
+    canonical = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    expected = hashlib.sha256(canonical.encode()).hexdigest()
+    schema_path = tmp_path / "tools.json"
+    manifest = _manifest()
+    manifest["tool_schema"] = {
+        "domain": "airline",
+        "path": schema_path.name,
+        "sha256": expected,
+    }
+    manifest_path = _write(tmp_path, manifest)
+
+    pretty = json.dumps(schema, ensure_ascii=False, indent=2)
+    schema_path.write_bytes((pretty.replace("\n", "\r\n") + "\r\n").encode())
+    load_failure_steering_manifest(manifest_path)
+
+    schema_path.write_text(pretty + "\n", encoding="utf-8", newline="\n")
+    load_failure_steering_manifest(manifest_path)
+
+    schema[0]["function"]["name"] = "changed"
+    schema_path.write_text(json.dumps(schema), encoding="utf-8")
+    with pytest.raises(ValueError, match="sha256 does not match"):
+        load_failure_steering_manifest(manifest_path)
