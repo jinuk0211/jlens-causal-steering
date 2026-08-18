@@ -40,7 +40,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "method",
-        choices=["caa", "cast", "mera", "sadi", "iti", "austeer", "loreft", "jservo"],
+        choices=[
+            "caa",
+            "cast",
+            "mera",
+            "sadi",
+            "iti",
+            "austeer",
+            "loreft",
+            "jservo",
+            "all",
+        ],
     )
     parser.add_argument("manifest", type=Path)
     parser.add_argument("pairs", type=Path)
@@ -89,64 +99,86 @@ def main() -> int:
         "output_dir": args.output_dir,
         "tools": tools,
     }
-    if args.method == "jservo":
-        result = extract_failure_jservo(
-            runtime,
-            pairs,
-            model_id=model["model_id"],
-            model_revision=model["model_revision"],
-            failure_categories=args.categories or [args.category],
-            observation_layers=args.observation_layers,
-            control_layers=args.layers,
-            output_path=args.output_dir / "jservo.pt",
-            tools=tools,
-            bundle_size=args.top_k or 8,
-            protected_size=args.protected_k,
-            minimum_consistency=args.minimum_consistency,
-            force=args.force,
-        )
-    elif args.method == "caa":
-        result = extract_failure_caa(**common, force=args.force)
-    elif args.method == "cast":
-        if args.condition_pairs is None:
-            parser.error("cast requires --condition-pairs")
-        result = extract_failure_cast(
-            runtime,
-            pairs,
-            read_failure_cast_condition_pairs(args.condition_pairs),
-            model_id=model["model_id"],
-            model_revision=model["model_revision"],
-            failure_category=args.category,
-            behavior_layers=args.layers,
-            condition_layers=args.condition_layers,
-            output_dir=args.output_dir,
-            tools=tools,
-            force=args.force,
-        )
-    elif args.method == "mera":
-        result = extract_failure_mera(**common, force=args.force)
-    elif args.method == "sadi":
-        result = extract_failure_sadi(**common, top_k=args.top_k or 20, force=args.force)
-    elif args.method == "iti":
-        result = extract_failure_iti(**common, top_k=args.top_k or 8, force=args.force)
-    elif args.method == "austeer":
-        result = extract_failure_austeer(**common, top_k=args.top_k or 100, force=args.force)
-    else:
-        result = train_failure_loreft(
-            runtime,
-            pairs,
-            model_id=model["model_id"],
-            model_revision=model["model_revision"],
-            failure_category=args.category,
-            layers=args.layers,
-            ranks=args.ranks,
-            output_dir=args.output_dir,
-            tools=tools,
-            epochs=args.epochs,
-            learning_rate=args.learning_rate,
-            force=args.force,
-        )
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    methods = (
+        ["caa", "cast", "mera", "sadi", "iti", "austeer", "loreft"]
+        if args.method == "all"
+        else [args.method]
+    )
+    if "cast" in methods and args.condition_pairs is None:
+        parser.error("cast and all require --condition-pairs")
+    condition_pairs = (
+        read_failure_cast_condition_pairs(args.condition_pairs)
+        if args.condition_pairs is not None
+        else None
+    )
+    results = {}
+    for method in methods:
+        if method == "jservo":
+            result = extract_failure_jservo(
+                runtime,
+                pairs,
+                model_id=model["model_id"],
+                model_revision=model["model_revision"],
+                failure_categories=args.categories or [args.category],
+                observation_layers=args.observation_layers,
+                control_layers=args.layers,
+                output_path=args.output_dir / "jservo.pt",
+                tools=tools,
+                bundle_size=args.top_k or 8,
+                protected_size=args.protected_k,
+                minimum_consistency=args.minimum_consistency,
+                force=args.force,
+            )
+        elif method == "caa":
+            result = extract_failure_caa(**common, force=args.force)
+        elif method == "cast":
+            assert condition_pairs is not None
+            result = extract_failure_cast(
+                runtime,
+                pairs,
+                condition_pairs,
+                model_id=model["model_id"],
+                model_revision=model["model_revision"],
+                failure_category=args.category,
+                behavior_layers=args.layers,
+                condition_layers=args.condition_layers,
+                output_dir=args.output_dir,
+                tools=tools,
+                force=args.force,
+            )
+        elif method == "mera":
+            result = extract_failure_mera(**common, force=args.force)
+        elif method == "sadi":
+            result = extract_failure_sadi(
+                **common, top_k=args.top_k or 20, force=args.force
+            )
+        elif method == "iti":
+            result = extract_failure_iti(
+                **common, top_k=args.top_k or 8, force=args.force
+            )
+        elif method == "austeer":
+            result = extract_failure_austeer(
+                **common, top_k=args.top_k or 100, force=args.force
+            )
+        else:
+            result = train_failure_loreft(
+                runtime,
+                pairs,
+                model_id=model["model_id"],
+                model_revision=model["model_revision"],
+                failure_category=args.category,
+                layers=args.layers,
+                ranks=args.ranks,
+                output_dir=args.output_dir,
+                tools=tools,
+                epochs=args.epochs,
+                learning_rate=args.learning_rate,
+                force=args.force,
+            )
+        results[method] = result
+        print(json.dumps({method: result}, ensure_ascii=False, indent=2, sort_keys=True))
+    if len(results) > 1:
+        print(json.dumps({"completed": list(results)}, indent=2, sort_keys=True))
     return 0
 
 

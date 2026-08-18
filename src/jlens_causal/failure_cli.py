@@ -25,6 +25,10 @@ from jlens_causal.failure_pairs import (
     read_repairs,
     write_failure_response_pairs,
 )
+from jlens_causal.failure_repairs import (
+    Tau2AirlineRepairRuntime,
+    generate_validated_repairs,
+)
 from jlens_causal.failure_steering import (
     compile_failure_steering_matrix,
     load_failure_steering_manifest,
@@ -82,6 +86,27 @@ def _parser() -> argparse.ArgumentParser:
     pairs.add_argument("repairs")
     pairs.add_argument("manifest")
     pairs.add_argument("--output", required=True)
+    repairs = commands.add_parser(
+        "repairs",
+        help="generate counterfactual repairs and validate them with Tau2 replay",
+    )
+    repairs.add_argument("results")
+    repairs.add_argument("events")
+    repairs.add_argument("manifest")
+    repairs.add_argument("--output", required=True)
+    repairs.add_argument("--report")
+    repairs.add_argument("--pairs-output")
+    repairs.add_argument("--category", default="retry_without_state_change")
+    repairs.add_argument("--proposal-model", default="gpt-5.2")
+    repairs.add_argument("--review-model", default="gpt-4.1-2025-04-14")
+    repairs.add_argument("--reasoning-effort", default="low")
+    repairs.add_argument("--minimum-confidence", type=float, default=0.5)
+    repairs.add_argument("--max-attempts", type=int, default=3)
+    repairs.add_argument("--minimum-per-split", type=int, default=2)
+    repairs.add_argument("--maximum-per-split", type=int, default=0)
+    repairs.add_argument("--review-tpm", type=int, default=27_000)
+    repairs.add_argument("--api-retries", type=int, default=6)
+    repairs.add_argument("--overwrite", action="store_true")
     cast_conditions = commands.add_parser(
         "cast-conditions",
         help="build prospective CAST risk/control contexts at the same boundary",
@@ -132,6 +157,54 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     results = load_results(args.results)
+    if args.command == "repairs":
+        manifest = load_failure_steering_manifest(args.manifest)
+        events = read_events(args.events)
+        report_path = args.report or str(Path(args.output).with_suffix(".report.json"))
+        runtime = Tau2AirlineRepairRuntime(
+            results,
+            proposal_model=args.proposal_model,
+            review_model=args.review_model,
+            reasoning_effort=args.reasoning_effort,
+            review_tpm=args.review_tpm,
+            api_retries=args.api_retries,
+        )
+        report = generate_validated_repairs(
+            results,
+            events,
+            runtime,
+            output=args.output,
+            report=report_path,
+            category=args.category,
+            train_task_ids=manifest.train_task_ids,
+            validation_task_ids=manifest.validation_task_ids,
+            evaluation_task_ids=manifest.evaluation_task_ids,
+            minimum_confidence=args.minimum_confidence,
+            max_attempts=args.max_attempts,
+            minimum_per_split=args.minimum_per_split,
+            maximum_per_split=args.maximum_per_split,
+            overwrite=args.overwrite,
+        )
+        summary: dict[str, Any] = {
+            "output": str(Path(args.output).expanduser().resolve()),
+            "report": str(Path(report_path).expanduser().resolve()),
+            "accepted": report["accepted"],
+            "complete": report["complete"],
+        }
+        if args.pairs_output:
+            pairs = build_failure_response_pairs(
+                results,
+                events,
+                read_repairs(args.output),
+                train_task_ids=manifest.train_task_ids,
+                validation_task_ids=manifest.validation_task_ids,
+                evaluation_task_ids=manifest.evaluation_task_ids,
+            )
+            output = write_failure_response_pairs(args.pairs_output, pairs)
+            summary["pairs_output"] = str(output)
+            summary["pairs"] = len(pairs)
+        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
     if args.command == "cast-conditions":
         manifest = load_failure_steering_manifest(args.manifest)
         cast_pairs = build_failure_cast_condition_pairs(

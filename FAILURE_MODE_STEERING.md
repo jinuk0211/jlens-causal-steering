@@ -63,6 +63,23 @@ tasks. Evaluation tasks cannot be used to build repair pairs. The runner,
 preflight, and analyzer validate the compiled IDs against Tau2's checked-in
 `data/tau2/domains/airline/split_tasks.json` and reject any mismatch.
 
+For the lean Core-7 protocol, the restartable end-to-end driver performs the
+whole sequence below: merge/audit, LLM-proposed repairs, Tau2 schema and
+environment replay, independent repair review, all seven artifact extractions
+with one model load, validation-only strength selection, and frozen evaluation.
+It runs 21 validation conditions and seven selected evaluation conditions
+(266 trajectories), not every condition in the compiled 83-row control matrix.
+Existing valid repairs, artifacts, simulations, and reviews are reused.
+
+```bash
+cd /workspace/jlens-causal-steering
+source .venv/bin/activate
+bash scripts/run_taubench_core7_lean266.sh
+```
+
+The driver prompts for `HF_TOKEN` and `OPENAI_API_KEY` when they are not already
+set. Never put either value in a command file or commit it to the repository.
+
 Compile the Core-7 plus J-Servo condition matrix without loading a model:
 
 ```powershell

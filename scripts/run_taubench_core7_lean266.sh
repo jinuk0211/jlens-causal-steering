@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# End-to-end, restartable TauBench Airline Core-7 run:
+# repairs -> seven artifacts -> validation selection -> frozen evaluation.
+
+set -Eeuo pipefail
+
+CAUSAL_ROOT="${CAUSAL_ROOT:-/workspace/jlens-causal-steering}"
+TAU2_ROOT="${TAU2_ROOT:-/workspace/tau2-bench}"
+ARTIFACT_ROOT="${ARTIFACT_ROOT:-/workspace/jlens-artifacts/taubench-airline/retry}"
+PREFIX="${PREFIX:-failure-steering-lean266-v1}"
+REVIEW_MODEL="${REVIEW_MODEL:-gpt-4.1-2025-04-14}"
+USER_MODEL="${USER_MODEL:-gpt-5.2-2025-12-11}"
+PROPOSAL_MODEL="${PROPOSAL_MODEL:-gpt-5.2}"
+REPAIR_MAX_ATTEMPTS="${REPAIR_MAX_ATTEMPTS:-5}"
+REPAIR_MAX_PER_SPLIT="${REPAIR_MAX_PER_SPLIT:-8}"
+REVIEW_ATTEMPTS="${REVIEW_ATTEMPTS:-3}"
+REVIEW_RETRY_DELAY_SECONDS="${REVIEW_RETRY_DELAY_SECONDS:-65}"
+
+MANIFEST="${CAUSAL_ROOT}/configs/taubench_airline_failure_modes_qwen35_4b.json"
+TOOLS_JSON="${CAUSAL_ROOT}/configs/taubench_airline_tools.json"
+MATRIX="${CAUSAL_ROOT}/outputs/taubench-airline-failure-matrix.json"
+MERGED="${CAUSAL_ROOT}/outputs/taubench-airline-merged-reviewed.json"
+AUDIT_DIR="${CAUSAL_ROOT}/outputs/taubench-airline-failure-audit"
+EVENTS="${AUDIT_DIR}/failure-events.jsonl"
+REPAIRS="${CAUSAL_ROOT}/outputs/taubench-airline-repairs.jsonl"
+REPAIR_REPORT="${CAUSAL_ROOT}/outputs/taubench-airline-repairs.report.json"
+REPAIR_PAIRS="${CAUSAL_ROOT}/outputs/taubench-airline-repair-pairs.jsonl"
+CAST_PAIRS="${CAUSAL_ROOT}/outputs/taubench-airline-cast-condition-pairs.jsonl"
+RESULTS_ROOT="data/simulations/${PREFIX}"
+TELEMETRY_ROOT="data/jlens-telemetry/${PREFIX}"
+ANALYSIS_ROOT="data/analysis/${PREFIX}"
+RUN_LOG="${RUN_LOG:-/workspace/taubench-core7-lean266.log}"
+WORKER_LOG="${WORKER_LOG:-/workspace/jlens-remote-worker-lean266.log}"
+
+TRAIN_REVIEWED="${TAU2_ROOT}/data/simulations/failure-steering/train/baseline/results_reviewed.json"
+VALIDATION_REVIEWED="${TAU2_ROOT}/data/simulations/failure-steering/validation/baseline/results_reviewed.json"
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_file() {
+  [[ -s "$1" ]] || die "required file is missing or empty: $1"
+}
+
+prompt_secret() {
+  local name="$1"
+  local prompt="$2"
+  if [[ -n "${!name:-}" ]]; then
+    export "$name"
+    return
+  fi
+  [[ -r /dev/tty ]] || die "$name is unset and no interactive terminal is available"
+  local value
+  IFS= read -rsp "$prompt" value </dev/tty
+  echo >/dev/tty
+  [[ -n "$value" ]] || die "$name may not be empty"
+  printf -v "$name" '%s' "$value"
+  export "$name"
+}
+
+[[ -d "$CAUSAL_ROOT" ]] || die "causal repository not found: $CAUSAL_ROOT"
+[[ -d "$TAU2_ROOT" ]] || die "Tau2 repository not found: $TAU2_ROOT"
+require_file "$MANIFEST"
+require_file "$TOOLS_JSON"
+require_file "$TRAIN_REVIEWED"
+require_file "$VALIDATION_REVIEWED"
+
+source "${CAUSAL_ROOT}/.venv/bin/activate"
+prompt_secret HF_TOKEN "HF_TOKEN: "
+prompt_secret OPENAI_API_KEY "OPENAI_API_KEY: "
+
+mkdir -p "${CAUSAL_ROOT}/outputs" "$ARTIFACT_ROOT"
+touch "$RUN_LOG"
+
+echo "===== Prepare reviewed failure data =====" | tee -a "$RUN_LOG"
+cd "$CAUSAL_ROOT"
+python -m jlens_causal.failure_cli merge \
+  "$TRAIN_REVIEWED" \
+  "$VALIDATION_REVIEWED" \
+  --output "$MERGED" \
+  2>&1 | tee -a "$RUN_LOG"
+
+python -m jlens_causal.failure_cli audit \
+  "$MERGED" \
+  --output-dir "$AUDIT_DIR" \
+  2>&1 | tee -a "$RUN_LOG"
+
+echo "===== Generate and validate counterfactual repairs =====" | tee -a "$RUN_LOG"
+python -u -m jlens_causal.failure_cli repairs \
+  "$MERGED" \
+  "$EVENTS" \
+  "$MANIFEST" \
+  --category retry_without_state_change \
+  --output "$REPAIRS" \
+  --report "$REPAIR_REPORT" \
+  --pairs-output "$REPAIR_PAIRS" \
+  --proposal-model "$PROPOSAL_MODEL" \
+  --review-model "$REVIEW_MODEL" \
+  --reasoning-effort low \
+  --minimum-per-split 2 \
+  --maximum-per-split "$REPAIR_MAX_PER_SPLIT" \
+  --max-attempts "$REPAIR_MAX_ATTEMPTS" \
+  --review-tpm 27000 \
+  2>&1 | tee -a "$RUN_LOG"
+
+python -m jlens_causal.failure_cli cast-conditions \
+  "$MERGED" \
+  "$EVENTS" \
+  "$MANIFEST" \
+  --category retry_without_state_change \
+  --output "$CAST_PAIRS" \
+  2>&1 | tee -a "$RUN_LOG"
+
+python -m jlens_causal.failure_cli compile \
+  "$MANIFEST" \
+  --output "$MATRIX" \
+  2>&1 | tee -a "$RUN_LOG"
+
+require_file "$REPAIR_PAIRS"
+require_file "$CAST_PAIRS"
+require_file "$MATRIX"
+
+ARTIFACTS=(
+  "$ARTIFACT_ROOT/caa-layer-20.pt"
+  "$ARTIFACT_ROOT/cast-layer-20.pt"
+  "$ARTIFACT_ROOT/mera-layer-20.pt"
+  "$ARTIFACT_ROOT/sadi-hidden-units.pt"
+  "$ARTIFACT_ROOT/iti-heads.pt"
+  "$ARTIFACT_ROOT/austeer-attention-aus.pt"
+  "$ARTIFACT_ROOT/loreft-rank-4.pt"
+)
+
+ARTIFACTS_READY=1
+for artifact in "${ARTIFACTS[@]}"; do
+  if [[ ! -s "$artifact" ]]; then
+    ARTIFACTS_READY=0
+    break
+  fi
+done
+
+if [[ "$ARTIFACTS_READY" == 1 ]]; then
+  echo "===== Core-7 artifacts already complete =====" | tee -a "$RUN_LOG"
+else
+  echo "===== Extract all seven Core-7 artifacts (one model load) =====" | tee -a "$RUN_LOG"
+  python scripts/extract_airline_failure_artifacts.py all \
+    "$MANIFEST" \
+    "$REPAIR_PAIRS" \
+    --category retry_without_state_change \
+    --layers 20 24 \
+    --condition-layers 16 20 24 \
+    --condition-pairs "$CAST_PAIRS" \
+    --tools-json "$TOOLS_JSON" \
+    --output-dir "$ARTIFACT_ROOT" \
+    --ranks 4 \
+    --epochs 8 \
+    2>&1 | tee -a "$RUN_LOG"
+fi
+
+for artifact in "${ARTIFACTS[@]}"; do
+  require_file "$artifact"
+done
+
+echo "===== Start authenticated local GPU worker =====" | tee -a "$RUN_LOG"
+WORKER_PORT="$(
+python - <<'PY'
+import socket
+
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+)"
+export JLENS_REMOTE_ENDPOINT="http://127.0.0.1:${WORKER_PORT}"
+export JLENS_REMOTE_TOKEN="${JLENS_REMOTE_TOKEN:-$(python -c 'import secrets; print(secrets.token_urlsafe(48))')}"
+
+cd "$TAU2_ROOT"
+python scripts/jlens_remote_worker.py \
+  --host 127.0.0.1 \
+  --port "$WORKER_PORT" \
+  >"$WORKER_LOG" 2>&1 &
+WORKER_PID=$!
+
+cleanup() {
+  kill "$WORKER_PID" 2>/dev/null || true
+  wait "$WORKER_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+WORKER_READY=0
+for _ in $(seq 1 120); do
+  if curl -fsS "${JLENS_REMOTE_ENDPOINT}/health" >/dev/null; then
+    WORKER_READY=1
+    break
+  fi
+  if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+    tail -n 100 "$WORKER_LOG" >&2
+    die "worker failed to start"
+  fi
+  sleep 2
+done
+if [[ "$WORKER_READY" != 1 ]]; then
+  tail -n 100 "$WORKER_LOG" >&2
+  die "worker readiness timeout"
+fi
+
+python scripts/preflight_failure_steering.py \
+  "$MATRIX" \
+  --method all \
+  --require-hf-token \
+  2>&1 | tee -a "$RUN_LOG"
+
+review_valid() {
+  local results="$1"
+  local reviewed="$2"
+  [[ -s "$results" && -s "$reviewed" ]] || return 1
+  python - "$results" "$reviewed" <<'PY'
+import json
+import sys
+
+raw = json.load(open(sys.argv[1], encoding="utf-8"))
+reviewed = json.load(open(sys.argv[2], encoding="utf-8"))
+
+def keys(value):
+    return {
+        (str(item.get("task_id", "")), int(item.get("trial", 0) or 0))
+        for item in value.get("simulations", [])
+    }
+
+if not keys(raw) or keys(raw) != keys(reviewed):
+    raise SystemExit(1)
+for item in reviewed.get("simulations", []):
+    review = item.get("review")
+    if not isinstance(review, dict):
+        raise SystemExit(1)
+    if not str(review.get("summary", "")).strip() and review.get("cost") is None:
+        raise SystemExit(1)
+PY
+}
+
+echo "===== Copy verified baselines into lean run namespace =====" | tee -a "$RUN_LOG"
+for split in validation evaluation; do
+  source_baseline="data/simulations/failure-steering/${split}/baseline"
+  target_parent="${RESULTS_ROOT}/${split}"
+  target_baseline="${target_parent}/baseline"
+  require_file "${source_baseline}/results.json"
+  require_file "${source_baseline}/results_reviewed.json"
+  review_valid "${source_baseline}/results.json" "${source_baseline}/results_reviewed.json" \
+    || die "source ${split} baseline review is incomplete"
+  mkdir -p "$target_parent"
+  if [[ -d "$target_baseline" ]] \
+    && ! review_valid "${target_baseline}/results.json" "${target_baseline}/results_reviewed.json"; then
+    mv "$target_baseline" "${target_baseline}.invalid-$(date +%Y%m%d-%H%M%S)"
+  fi
+  if [[ ! -d "$target_baseline" ]]; then
+    cp -a "$source_baseline" "$target_parent/"
+  fi
+done
+
+run_and_review() {
+  local split="$1"
+  local condition="$2"
+  local condition_dir="${RESULTS_ROOT}/${split}/${condition}"
+  local results="${condition_dir}/results.json"
+  local reviewed="${condition_dir}/results_reviewed.json"
+
+  echo "===== ${condition}: ${split} =====" | tee -a "$RUN_LOG"
+  python scripts/run_airline_failure_steering.py \
+    "$MATRIX" \
+    --condition "$condition" \
+    --split "$split" \
+    --save-prefix "$PREFIX" \
+    --user-llm "$USER_MODEL" \
+    --user-llm-args '{"reasoning_effort":"low"}' \
+    2>&1 | tee -a "$RUN_LOG"
+
+  if review_valid "$results" "$reviewed"; then
+    echo "Review already complete: $reviewed" | tee -a "$RUN_LOG"
+    return
+  fi
+
+  local attempt
+  for attempt in $(seq 1 "$REVIEW_ATTEMPTS"); do
+    if [[ -e "$reviewed" ]]; then
+      mv "$reviewed" "${reviewed%.json}.invalid-$(date +%Y%m%d-%H%M%S).json"
+    fi
+    echo "Review attempt ${attempt}/${REVIEW_ATTEMPTS}: ${condition}" | tee -a "$RUN_LOG"
+    if python -m tau2.cli review \
+      "$results" \
+      --mode full \
+      --show-details \
+      --max-concurrency 1 \
+      --review-model "$REVIEW_MODEL" \
+      2>&1 | tee -a "$RUN_LOG"; then
+      if review_valid "$results" "$reviewed"; then
+        return
+      fi
+    fi
+    if [[ "$attempt" -lt "$REVIEW_ATTEMPTS" ]]; then
+      echo "Review incomplete; waiting ${REVIEW_RETRY_DELAY_SECONDS}s before retry" \
+        | tee -a "$RUN_LOG"
+      sleep "$REVIEW_RETRY_DELAY_SECONDS"
+    fi
+  done
+  die "invalid or incomplete review after ${REVIEW_ATTEMPTS} attempts: $reviewed"
+}
+
+VALIDATION_CONDITIONS=(
+  retry_without_state_change-caa-s0.5
+  retry_without_state_change-caa-s1
+  retry_without_state_change-caa-s2
+  retry_without_state_change-cast-s0.5
+  retry_without_state_change-cast-s1
+  retry_without_state_change-cast-s2
+  retry_without_state_change-mera-s0.5
+  retry_without_state_change-mera-s1
+  retry_without_state_change-mera-s2
+  retry_without_state_change-sadi-s5
+  retry_without_state_change-sadi-s10
+  retry_without_state_change-sadi-s20
+  retry_without_state_change-iti-s5
+  retry_without_state_change-iti-s10
+  retry_without_state_change-iti-s15
+  retry_without_state_change-austeer-s5
+  retry_without_state_change-austeer-s10
+  retry_without_state_change-austeer-s15
+  retry_without_state_change-loreft-s0.5
+  retry_without_state_change-loreft-s1
+  retry_without_state_change-loreft-s2
+)
+
+for condition in "${VALIDATION_CONDITIONS[@]}"; do
+  run_and_review validation "$condition"
+done
+
+python scripts/analyze_airline_failure_steering.py \
+  "$MATRIX" \
+  --split validation \
+  --results-root "$RESULTS_ROOT" \
+  --telemetry-root "$TELEMETRY_ROOT" \
+  --output-dir "$ANALYSIS_ROOT" \
+  2>&1 | tee -a "$RUN_LOG"
+
+mapfile -t EVALUATION_CONDITIONS < <(
+  python - "$ANALYSIS_ROOT/validation.json" <<'PY'
+import json
+import math
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+methods = ["caa", "cast", "mera", "sadi", "iti", "austeer", "loreft"]
+
+def number(value):
+    return -math.inf if value is None else float(value)
+
+for method in methods:
+    candidates = [
+        row
+        for row in data["summary"]
+        if row["method"] == method
+        and row["control_type"] == "targeted"
+        and row["paired_coverage"] == 1.0
+        and row["review_coverage"] == 1.0
+    ]
+    if len(candidates) != 3:
+        raise SystemExit(f"{method}: expected 3 complete conditions, found {len(candidates)}")
+    best = max(
+        candidates,
+        key=lambda row: (
+            number(row.get("mean_task_success")),
+            number(row.get("mean_task_reward")),
+            number(row.get("mean_repeat_reduction_vs_baseline")),
+            number(row.get("mean_tool_error_reduction_vs_baseline")),
+            -abs(number(row.get("strength"))),
+        ),
+    )
+    print(best["condition"])
+PY
+)
+
+[[ "${#EVALUATION_CONDITIONS[@]}" -eq 7 ]] \
+  || die "expected seven selected evaluation conditions"
+printf '%s\n' "${EVALUATION_CONDITIONS[@]}" \
+  | tee /workspace/core7-selected-conditions.txt \
+  | tee -a "$RUN_LOG"
+
+for condition in "${EVALUATION_CONDITIONS[@]}"; do
+  run_and_review evaluation "$condition"
+done
+
+python scripts/analyze_airline_failure_steering.py \
+  "$MATRIX" \
+  --split evaluation \
+  --results-root "$RESULTS_ROOT" \
+  --telemetry-root "$TELEMETRY_ROOT" \
+  --output-dir "$ANALYSIS_ROOT" \
+  2>&1 | tee -a "$RUN_LOG"
+
+echo "Lean Core-7 complete" | tee -a "$RUN_LOG"
+echo "Validation: 21 conditions x 6 tasks = 126" | tee -a "$RUN_LOG"
+echo "Evaluation: 7 selected conditions x 20 tasks = 140" | tee -a "$RUN_LOG"
+echo "Total: 266 trajectories" | tee -a "$RUN_LOG"
+echo "Selected conditions: /workspace/core7-selected-conditions.txt" | tee -a "$RUN_LOG"
+echo "Analysis: ${TAU2_ROOT}/${ANALYSIS_ROOT}" | tee -a "$RUN_LOG"
+echo "Log: ${RUN_LOG}" | tee -a "$RUN_LOG"
