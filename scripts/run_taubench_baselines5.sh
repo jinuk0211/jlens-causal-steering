@@ -10,6 +10,8 @@ ARTIFACT_ROOT="${ARTIFACT_ROOT:-/workspace/jlens-artifacts/taubench-airline/tool
 PREFIX="${PREFIX:-failure-steering-baselines5-v1}"
 BASELINE_PREFIX="${BASELINE_PREFIX:-failure-steering}"
 FAILURE_CATEGORY="tool_call_error"
+MINIMUM_TRAIN_EVENTS=2
+MINIMUM_VALIDATION_EVENTS=1
 REVIEW_MODEL="${REVIEW_MODEL:-gpt-4.1-2025-04-14}"
 USER_MODEL="${USER_MODEL:-gpt-5.2-2025-12-11}"
 PROPOSAL_MODEL="${PROPOSAL_MODEL:-gpt-5.2}"
@@ -94,13 +96,20 @@ python -m jlens_causal.failure_cli audit \
   --output-dir "$AUDIT_DIR" \
   2>&1 | tee -a "$RUN_LOG"
 
-python - "$EVENTS" "$MANIFEST" "$FAILURE_CATEGORY" <<'PY' \
+python - \
+  "$EVENTS" \
+  "$MANIFEST" \
+  "$FAILURE_CATEGORY" \
+  "$MINIMUM_TRAIN_EVENTS" \
+  "$MINIMUM_VALIDATION_EVENTS" <<'PY' \
   2>&1 | tee -a "$RUN_LOG"
 import json
 import sys
 from collections import Counter
 
-events_path, manifest_path, category = sys.argv[1:]
+events_path, manifest_path, category, minimum_train, minimum_validation = sys.argv[1:]
+minimum_train = int(minimum_train)
+minimum_validation = int(minimum_validation)
 manifest = json.load(open(manifest_path, encoding="utf-8"))
 split_by_task = {
     str(task_id): split
@@ -121,9 +130,10 @@ print("eligible structural/review event inventory:")
 for (name, split), count in sorted(inventory.items()):
     print(f"  {name:36s} {split:10s} {count}")
 print(f"selected category {category!r}: train={counts['train']} validation={counts['validation']}")
-if counts["train"] < 2 or counts["validation"] < 2:
+if counts["train"] < minimum_train or counts["validation"] < minimum_validation:
     raise SystemExit(
-        "Need at least two eligible events in both train and validation. "
+        f"Need at least {minimum_train} eligible train event(s) and "
+        f"{minimum_validation} eligible validation event(s). "
         "Rerun the no-steering collection with larger BASELINE_TRAIN_TRIALS and "
         "BASELINE_VALIDATION_TRIALS before artifact extraction."
     )
@@ -141,7 +151,7 @@ python -u -m jlens_causal.failure_cli repairs \
   --proposal-model "$PROPOSAL_MODEL" \
   --review-model "$REVIEW_MODEL" \
   --reasoning-effort low \
-  --minimum-per-split 2 \
+  --minimum-per-split "$MINIMUM_VALIDATION_EVENTS" \
   --maximum-per-split "$REPAIR_MAX_PER_SPLIT" \
   --max-attempts "$REPAIR_MAX_ATTEMPTS" \
   --review-tpm 27000 \

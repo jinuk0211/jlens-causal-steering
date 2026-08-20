@@ -226,9 +226,12 @@ turn.
 
 ## 6. If the repair-pair gate stops the run
 
-The script prints an event inventory. If
-`tool_call_error` has fewer than two eligible train or validation
-events, increase only the calibration trials and resume:
+The script prints an event inventory. The current production run requires at
+least two eligible train events and one eligible validation event for
+`tool_call_error`. The one-event validation minimum is intentionally weak and
+keeps the observed 6-train/1-validation inventory runnable without collecting
+more baseline trajectories. If either minimum is not met, increase only the
+calibration trials and resume:
 
 ```bash
 cd /workspace/jlens-causal-steering
