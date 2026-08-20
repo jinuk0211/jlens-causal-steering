@@ -1,5 +1,6 @@
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -158,3 +159,33 @@ def test_tool_schema_fingerprint_is_independent_of_line_endings(tmp_path):
     schema_path.write_text(json.dumps(schema), encoding="utf-8")
     with pytest.raises(ValueError, match="sha256 does not match"):
         load_failure_steering_manifest(manifest_path)
+
+
+def test_qwen35_production_manifest_targets_tool_call_errors():
+    manifest_path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "taubench_airline_failure_modes_qwen35_4b.json"
+    )
+    manifest = load_failure_steering_manifest(manifest_path)
+    matrix = compile_failure_steering_matrix(manifest)
+    enabled = set(manifest.enabled_methods)
+    targeted = [
+        item
+        for item in matrix["conditions"]
+        if item["control_type"] == "targeted" and item["method"] in enabled
+    ]
+
+    assert set(manifest.raw["failure_modes"]) == {"tool_call_error"}
+    assert {item["method"] for item in targeted} == enabled
+    assert all(item["failure_category"] == "tool_call_error" for item in targeted)
+    assert all(
+        item["agent_llm_args"]["jlens_intervention"]["boundaries"]
+        == ["after_tool_error"]
+        for item in targeted
+    )
+    assert all(
+        "/tool-call-error/"
+        in item["agent_llm_args"]["jlens_intervention"]["vector_path"]
+        for item in targeted
+    )

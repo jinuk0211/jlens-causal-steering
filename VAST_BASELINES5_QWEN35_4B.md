@@ -29,7 +29,7 @@ no-steering train/validation runs
 ```
 
 There is no valid shortcut around the repair-pair gate. For the configured
-`retry_without_state_change` category, artifact extraction requires at least
+`tool_call_error` category, artifact extraction requires at least
 two eligible events and two validated repair pairs in both the train and
 validation task splits. More trials increase the opportunity to observe that
 failure but cannot guarantee it; a model that never exhibits the failure does
@@ -169,7 +169,7 @@ print("transformers", transformers.__version__)
 manifest_path = "configs/taubench_airline_failure_modes_qwen35_4b.json"
 manifest = json.load(open(manifest_path, encoding="utf-8"))
 assert manifest["enabled_methods"] == ["caa", "mera", "sadi", "iti", "austeer"]
-assert "cast" not in manifest["failure_modes"]["retry_without_state_change"]["methods"]
+assert "cast" not in manifest["failure_modes"]["tool_call_error"]["methods"]
 
 path = snapshot_download(
     repo_id="Qwen/Qwen3.5-4B",
@@ -223,7 +223,7 @@ completed task/trial checkpoints are reused when the driver is restarted.
 ## 6. If the repair-pair gate stops the run
 
 The script prints an event inventory. If
-`retry_without_state_change` has fewer than two eligible train or validation
+`tool_call_error` has fewer than two eligible train or validation
 events, increase only the calibration trials and resume:
 
 ```bash
@@ -243,6 +243,20 @@ is an experimental data result: the configured failure category is unsupported
 for this deterministic Qwen setup. Do not fabricate pairs or reuse evaluation
 tasks for calibration.
 
+For an existing checkpoint containing 72 train, 18 validation, and 20
+evaluation simulations, keep train/evaluation fixed and extend only validation:
+
+```bash
+export BASELINE_TRAIN_TRIALS=3
+export BASELINE_VALIDATION_TRIALS=5
+export BASELINE_EVALUATION_TRIALS=1
+
+bash scripts/run_taubench_baselines5_fresh_vast.sh
+```
+
+This reuses all 110 completed simulations and requests only the 12 new
+validation simulations before rebuilding the full validation review.
+
 ## 7. Expected artifacts and workload
 
 Validated pair data:
@@ -256,11 +270,11 @@ Validated pair data:
 Five model artifacts:
 
 ```text
-/workspace/jlens-artifacts/taubench-airline/retry/caa-layer-20.pt
-/workspace/jlens-artifacts/taubench-airline/retry/mera-layer-20.pt
-/workspace/jlens-artifacts/taubench-airline/retry/sadi-hidden-units.pt
-/workspace/jlens-artifacts/taubench-airline/retry/iti-heads.pt
-/workspace/jlens-artifacts/taubench-airline/retry/austeer-attention-aus.pt
+/workspace/jlens-artifacts/taubench-airline/tool-call-error/caa-layer-20.pt
+/workspace/jlens-artifacts/taubench-airline/tool-call-error/mera-layer-20.pt
+/workspace/jlens-artifacts/taubench-airline/tool-call-error/sadi-hidden-units.pt
+/workspace/jlens-artifacts/taubench-airline/tool-call-error/iti-heads.pt
+/workspace/jlens-artifacts/taubench-airline/tool-call-error/austeer-attention-aus.pt
 ```
 
 Final selection and analysis:

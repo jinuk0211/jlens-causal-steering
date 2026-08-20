@@ -6,10 +6,10 @@ set -Eeuo pipefail
 
 CAUSAL_ROOT="${CAUSAL_ROOT:-/workspace/jlens-causal-steering}"
 TAU2_ROOT="${TAU2_ROOT:-/workspace/tau2-bench}"
-ARTIFACT_ROOT="${ARTIFACT_ROOT:-/workspace/jlens-artifacts/taubench-airline/retry}"
+ARTIFACT_ROOT="${ARTIFACT_ROOT:-/workspace/jlens-artifacts/taubench-airline/tool-call-error}"
 PREFIX="${PREFIX:-failure-steering-baselines5-v1}"
 BASELINE_PREFIX="${BASELINE_PREFIX:-failure-steering}"
-FAILURE_CATEGORY="retry_without_state_change"
+FAILURE_CATEGORY="tool_call_error"
 REVIEW_MODEL="${REVIEW_MODEL:-gpt-4.1-2025-04-14}"
 USER_MODEL="${USER_MODEL:-gpt-5.2-2025-12-11}"
 PROPOSAL_MODEL="${PROPOSAL_MODEL:-gpt-5.2}"
@@ -382,21 +382,21 @@ run_and_review() {
 }
 
 VALIDATION_CONDITIONS=(
-  retry_without_state_change-caa-s0.5
-  retry_without_state_change-caa-s1
-  retry_without_state_change-caa-s2
-  retry_without_state_change-mera-s0.5
-  retry_without_state_change-mera-s1
-  retry_without_state_change-mera-s2
-  retry_without_state_change-sadi-s5
-  retry_without_state_change-sadi-s10
-  retry_without_state_change-sadi-s20
-  retry_without_state_change-iti-s5
-  retry_without_state_change-iti-s10
-  retry_without_state_change-iti-s15
-  retry_without_state_change-austeer-s5
-  retry_without_state_change-austeer-s10
-  retry_without_state_change-austeer-s15
+  tool_call_error-caa-s0.5
+  tool_call_error-caa-s1
+  tool_call_error-caa-s2
+  tool_call_error-mera-s0.5
+  tool_call_error-mera-s1
+  tool_call_error-mera-s2
+  tool_call_error-sadi-s5
+  tool_call_error-sadi-s10
+  tool_call_error-sadi-s20
+  tool_call_error-iti-s5
+  tool_call_error-iti-s10
+  tool_call_error-iti-s15
+  tool_call_error-austeer-s5
+  tool_call_error-austeer-s10
+  tool_call_error-austeer-s15
 )
 
 for condition in "${VALIDATION_CONDITIONS[@]}"; do
