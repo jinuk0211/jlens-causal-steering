@@ -10,6 +10,7 @@ BASELINE_PREFIX="${BASELINE_PREFIX:-failure-steering}"
 BASELINE_TRAIN_TRIALS="${BASELINE_TRAIN_TRIALS:-5}"
 BASELINE_VALIDATION_TRIALS="${BASELINE_VALIDATION_TRIALS:-5}"
 BASELINE_EVALUATION_TRIALS="${BASELINE_EVALUATION_TRIALS:-1}"
+SIMULATION_TIMEOUT_SECONDS="${SIMULATION_TIMEOUT_SECONDS:-1200}"
 USER_MODEL="${USER_MODEL:-gpt-5.2-2025-12-11}"
 REVIEW_MODEL="${REVIEW_MODEL:-gpt-4.1-2025-04-14}"
 REVIEW_ATTEMPTS="${REVIEW_ATTEMPTS:-3}"
@@ -41,6 +42,7 @@ require_file "${CAUSAL_ROOT}/.venv/bin/activate"
 require_positive_integer BASELINE_TRAIN_TRIALS "$BASELINE_TRAIN_TRIALS"
 require_positive_integer BASELINE_VALIDATION_TRIALS "$BASELINE_VALIDATION_TRIALS"
 require_positive_integer BASELINE_EVALUATION_TRIALS "$BASELINE_EVALUATION_TRIALS"
+require_positive_integer SIMULATION_TIMEOUT_SECONDS "$SIMULATION_TIMEOUT_SECONDS"
 
 source "${CAUSAL_ROOT}/.venv/bin/activate"
 mkdir -p "${CAUSAL_ROOT}/outputs"
@@ -225,6 +227,7 @@ collect_split() {
     --split "$split" \
     --num-trials "$trials" \
     --max-concurrency 1 \
+    --simulation-timeout-seconds "$SIMULATION_TIMEOUT_SECONDS" \
     --save-prefix "$BASELINE_PREFIX" \
     --user-llm "$USER_MODEL" \
     --user-llm-args '{"reasoning_effort":"low"}' \

@@ -191,6 +191,7 @@ evaluation.
 export BASELINE_TRAIN_TRIALS=5
 export BASELINE_VALIDATION_TRIALS=5
 export BASELINE_EVALUATION_TRIALS=1
+export SIMULATION_TIMEOUT_SECONDS=1200
 
 export USER_MODEL='gpt-5.2-2025-12-11'
 export REVIEW_MODEL='gpt-4.1-2025-04-14'
@@ -216,6 +217,8 @@ nvidia-smi
 
 The driver is restartable. After an SSH disconnect or recoverable API failure,
 run the same command again inside the same instance and workspace.
+Each individual simulation is capped at 1200 wallclock seconds by default;
+completed task/trial checkpoints are reused when the driver is restarted.
 
 ## 6. If the repair-pair gate stops the run
 

@@ -17,6 +17,7 @@ REPAIR_MAX_ATTEMPTS="${REPAIR_MAX_ATTEMPTS:-5}"
 REPAIR_MAX_PER_SPLIT="${REPAIR_MAX_PER_SPLIT:-8}"
 REVIEW_ATTEMPTS="${REVIEW_ATTEMPTS:-3}"
 REVIEW_RETRY_DELAY_SECONDS="${REVIEW_RETRY_DELAY_SECONDS:-65}"
+SIMULATION_TIMEOUT_SECONDS="${SIMULATION_TIMEOUT_SECONDS:-1200}"
 
 MANIFEST="${CAUSAL_ROOT}/configs/taubench_airline_failure_modes_qwen35_4b.json"
 TOOLS_JSON="${CAUSAL_ROOT}/configs/taubench_airline_tools.json"
@@ -45,6 +46,10 @@ require_file() {
   [[ -s "$1" ]] || die "required file is missing or empty: $1"
 }
 
+require_positive_integer() {
+  [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "$1 must be a positive integer, got: $2"
+}
+
 prompt_secret() {
   local name="$1"
   local prompt="$2"
@@ -67,6 +72,7 @@ require_file "$MANIFEST"
 require_file "$TOOLS_JSON"
 require_file "$TRAIN_REVIEWED"
 require_file "$VALIDATION_REVIEWED"
+require_positive_integer SIMULATION_TIMEOUT_SECONDS "$SIMULATION_TIMEOUT_SECONDS"
 
 source "${CAUSAL_ROOT}/.venv/bin/activate"
 prompt_secret HF_TOKEN "HF_TOKEN: "
@@ -338,6 +344,7 @@ run_and_review() {
     "$MATRIX" \
     --condition "$condition" \
     --split "$split" \
+    --simulation-timeout-seconds "$SIMULATION_TIMEOUT_SECONDS" \
     --save-prefix "$PREFIX" \
     --user-llm "$USER_MODEL" \
     --user-llm-args '{"reasoning_effort":"low"}' \
