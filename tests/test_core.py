@@ -19,7 +19,6 @@ from jlens_causal.baselines import (
     build_caa_artifact,
     build_cast_artifact,
     build_iti_artifact,
-    build_loreft_artifact,
     build_mera_artifact,
     build_sadi_artifact,
     caa_mean_difference,
@@ -30,7 +29,6 @@ from jlens_causal.baselines import (
     load_caa_artifact,
     load_cast_artifact,
     load_iti_artifact,
-    load_loreft_artifact,
     load_mera_artifact,
     load_sadi_artifact,
     mera_closed_form_delta,
@@ -39,7 +37,6 @@ from jlens_causal.baselines import (
     save_caa_artifact,
     save_cast_artifact,
     save_iti_artifact,
-    save_loreft_artifact,
     save_mera_artifact,
     save_sadi_artifact,
     select_cast_gate,
@@ -47,7 +44,6 @@ from jlens_causal.baselines import (
     validate_caa_artifact,
     validate_cast_artifact,
     validate_iti_artifact,
-    validate_loreft_artifact,
     validate_mera_artifact,
     validate_sadi_artifact,
 )
@@ -79,16 +75,13 @@ from jlens_causal.interventions import (
     generation_intervention_hook,
     intervention_hook,
     iti_generation_hooks,
-    loreft_generation_hooks,
     matched_prompt_positions,
     mera_generation_hook,
     sadi_generation_hooks,
 )
-from jlens_causal.loreft import LoReFTExample, train_loreft_artifact
 from jlens_causal.metrics import analyze_runs, paired_trial_metrics
 from jlens_causal.modeling import (
     GenerationResult,
-    ModelRuntime,
     _render_chat_text,
     _rendered_message_span,
     completion_status,
@@ -868,106 +861,6 @@ class DirectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "malformed"):
             validate_austeer_artifact(tampered)
 
-    def test_loreft_artifact_preserves_orthogonal_low_rank_parameters(self) -> None:
-        try:
-            import torch
-        except ImportError:
-            self.skipTest("torch unavailable")
-        artifact = build_loreft_artifact(
-            torch,
-            model_id="toy",
-            model_revision="a" * 40,
-            layers=[2],
-            rotate_by_layer={2: torch.tensor([[1.0], [0.0], [0.0]])},
-            learned_weight_by_layer={2: torch.tensor([[0.0, 1.0, 0.0]])},
-            learned_bias_by_layer={2: torch.tensor([0.5])},
-            train_example_ids=["t0"],
-            validation_example_ids=["v0"],
-            rank=1,
-            benchmark="toy",
-            training={"optimizer": "adamw"},
-            validation_loss=1.25,
-            site="block_output",
-            position="last_prompt_token",
-            source={"repository": "stanfordnlp/pyreft", "revision": "b" * 40},
-        )
-        validate_loreft_artifact(artifact, expected_model_id="toy")
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "loreft.pt"
-            save_loreft_artifact(torch, artifact, path)
-            loaded = load_loreft_artifact(torch, path, expected_model_id="toy")
-        torch.testing.assert_close(loaded["rotations"], artifact["rotations"])
-
-    def test_loreft_training_freezes_base_and_returns_valid_checkpoint(self) -> None:
-        try:
-            import torch
-        except ImportError:
-            self.skipTest("torch unavailable")
-
-        class TinyModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.embedding = torch.nn.Embedding(7, 3)
-                self.layers = torch.nn.ModuleList([torch.nn.Identity()])
-                self.lm_head = torch.nn.Linear(3, 7, bias=False)
-
-            def forward(self, input_ids, attention_mask, labels, use_cache):
-                del attention_mask, use_cache
-                hidden = self.embedding(input_ids)
-                for layer in self.layers:
-                    hidden = layer(hidden)
-                logits = self.lm_head(hidden)
-                loss = torch.nn.functional.cross_entropy(
-                    logits[:, :-1].reshape(-1, 7),
-                    labels[:, 1:].reshape(-1),
-                    ignore_index=-100,
-                )
-                return SimpleNamespace(loss=loss)
-
-        model = TinyModel()
-        lens_model = SimpleNamespace(layers=model.layers, d_model=3)
-        runtime = ModelRuntime(
-            torch=torch,
-            tokenizer=None,
-            hf_model=model,
-            lens_model=lens_model,
-            lens=None,
-            device=torch.device("cpu"),
-        )
-        example = LoReFTExample(
-            example_id="train",
-            input_ids=torch.tensor([[1, 2, 3, 4]]),
-            attention_mask=torch.ones(1, 4, dtype=torch.long),
-            response_positions=(2, 3),
-            boundary_position=1,
-        )
-        validation = LoReFTExample(
-            example_id="validation",
-            input_ids=torch.tensor([[1, 2, 4, 3]]),
-            attention_mask=torch.ones(1, 4, dtype=torch.long),
-            response_positions=(2, 3),
-            boundary_position=1,
-        )
-        artifact = train_loreft_artifact(
-            runtime,
-            model_id="tiny",
-            model_revision="a" * 40,
-            layers=(0,),
-            rank=1,
-            train_examples=[example],
-            validation_examples=[validation],
-            epochs=1,
-            learning_rate=0.01,
-            weight_decay=0.0,
-            max_grad_norm=1.0,
-            seed=1,
-            benchmark="toy",
-            site="block_output",
-            source={"repository": "stanfordnlp/pyreft", "revision": "b" * 40},
-        )
-        validate_loreft_artifact(artifact, expected_model_id="tiny")
-        self.assertTrue(all(parameter.requires_grad for parameter in model.parameters()))
-
     def test_cross_domain_stable_target_selection(self) -> None:
         token_texts = [
             "good",
@@ -1333,37 +1226,6 @@ class InterventionTests(unittest.TestCase):
             torch.tensor([[[3.0, 1.0, 0.0], [3.0, 1.0, 0.0]]]),
         )
         self.assertEqual(trace["applied_prefill_scalars"], 4)
-
-    def test_loreft_replaces_low_rank_coordinate_at_last_prompt_token(self) -> None:
-        try:
-            import torch
-        except ImportError:
-            self.skipTest("torch unavailable")
-
-        class Block:
-            def register_forward_hook(self, hook):
-                self.hook = hook
-
-                class Handle:
-                    def remove(_self):
-                        pass
-
-                return Handle()
-
-        blocks = [Block()]
-        parameters = {
-            0: (
-                torch.tensor([[1.0], [0.0]]),
-                torch.tensor([[0.0, 1.0]]),
-                torch.tensor([0.5]),
-            )
-        }
-        with loreft_generation_hooks(blocks, parameters_by_layer=parameters) as trace:
-            prompt = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
-            steered = blocks[0].hook(None, (), prompt)
-        torch.testing.assert_close(steered[0, 0], torch.tensor([1.0, 2.0]))
-        torch.testing.assert_close(steered[0, 1], torch.tensor([4.5, 4.0]))
-        self.assertEqual(trace["applied_prefill_positions"], 1)
 
     def test_followup_wrong_position_has_exactly_matched_token_dose(self) -> None:
         document = tuple(range(10, 20))

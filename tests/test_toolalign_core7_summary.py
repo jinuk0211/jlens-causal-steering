@@ -67,8 +67,8 @@ def test_core7_summary_requires_both_roles_and_flattens_paired_rows(tmp_path):
     result = script.collect_core7(configs)
 
     assert result["complete"]
-    assert len(result["sources"]) == 14
-    assert len(result["rows"]) == 14
+    assert len(result["sources"]) == 12
+    assert len(result["rows"]) == 12
     assert {row["model_role"] for row in result["rows"]} == {"aligned", "abliterated"}
 
     (tmp_path / "caa" / "analysis" / "aligned.json").unlink()

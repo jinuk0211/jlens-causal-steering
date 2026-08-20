@@ -31,8 +31,8 @@ exact-token implementation (including position chunking).
   cycles, unresolved calls, protocol errors, and bad termination.
 - A replay plan with no-steer, post-hoc oracle, learned-gate, count-matched
   random-gate, negative-direction, and wrong-category conditions.
-- A remote-only Core-7 condition matrix for CAA, CAST, MERA, SADI, ITI,
-  AUSteer, and LoReFT.
+- A remote-only Core-6 condition matrix for CAA, CAST, MERA, SADI, ITI, and
+  AUSteer.
 - `jlens-jservo-v1` artifacts with failure-mode token bundles, observer/control
   layers, protected directions, target margins, natural-delta dose caps, and
   calibration fingerprints. The runtime computes the minimum remaining
@@ -40,7 +40,7 @@ exact-token implementation (including position chunking).
 - A non-executing candidate buffer with typed-schema, identifier-provenance,
   and unchanged-repeat validation. Cap excess, missing signal, or validator
   failure is recorded as `abstained` before a tool can execute.
-- Generic CAA, CAST, MERA, SADI, ITI, AUSteer, and LoReFT extractors using validated
+- Generic CAA, CAST, MERA, SADI, ITI, and AUSteer extractors using validated
   `repair - observed failure` action
   pairs. It measures the last token in the pairwise-divergent rendered action
   span, so a changed tool argument is measured instead of a shared XML/chat
@@ -49,10 +49,8 @@ exact-token implementation (including position chunking).
   loops, official agent-review errors, user-review errors, and verified
   intervention dose.
 - CAST learns a prospective failure-risk condition gate from failed and clean
-  decisions at the same structural opportunity boundary. LoReFT trains only
-  its low-rank intervention on repaired assistant continuations, selecting the
-  checkpoint on task-disjoint validation pairs.
-- Existing ToolAlign Core-7 full-trajectory analyzers for aligned-to-worse and
+  decisions at the same structural opportunity boundary.
+- Existing ToolAlign Core-6 full-trajectory analyzers for aligned-to-worse and
   abliterated-to-aligned behavior transitions.
 
 ## Leakage-controlled TauBench sequence
@@ -220,8 +218,7 @@ python scripts/extract_airline_failure_artifacts.py caa \
 
 Replace `caa` with `mera`, `sadi`, `iti`, or `austeer` for their artifacts.
 CAST additionally takes
-`--condition-pairs outputs/airline-cast-condition-pairs.jsonl`; LoReFT accepts
-`--ranks 4 --epochs 8`. All seven methods use the exact tool-bearing chat
+`--condition-pairs outputs/airline-cast-condition-pairs.jsonl`. All six methods use the exact tool-bearing chat
 template and task-disjoint train/validation roles.
 
 Extract one multi-mode J-Servo artifact from every failure category that has
@@ -280,7 +277,7 @@ The deployable claim is the learned/structural gate. The post-hoc oracle gate
 is only an upper bound. A causal success requires a paired improvement over the
 same task/trial baseline, nonzero verified dose at the intended boundary, and
 no comparable gain for negative-direction, wrong-category, wrong-layer, or
-count-matched random controls. SADI and LoReFT's explicit zero-strength rows are
+count-matched random controls. SADI's explicit zero-strength rows are
 classified as `zero_dose`; the analyzer keeps every layer and strength as a
 separate condition, reports agent-review and user-review errors separately,
 and gives improved/worsened discordant task counts with an exact paired
@@ -300,7 +297,7 @@ cd /workspace/jlens-causal-steering
 bash scripts/remote_toolalign_core7.sh caa full both
 ```
 
-Then run `cast`, `mera`, `sadi`, `iti`, `austeer`, and `loreft` one at a time.
+Then run `cast`, `mera`, `sadi`, `iti`, and `austeer` one at a time.
 Each analyzer compares every treatment with its exact alpha-zero case and
 reports both abliterated-to-aligned restoration and aligned-to-misaligned
 erosion, plus parse corruption, safe degradation, tool-signature changes, and

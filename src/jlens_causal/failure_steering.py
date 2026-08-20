@@ -12,7 +12,7 @@ from typing import Any
 FAILURE_STEERING_SCHEMA = "agent-failure-steering-v1"
 FAILURE_MATRIX_SCHEMA = "agent-failure-steering-matrix-v1"
 FAILURE_MATRIX_COMPILER_VERSION = "failure-steering-compiler-v2"
-CORE_METHODS = ("caa", "cast", "mera", "sadi", "iti", "austeer", "loreft")
+CORE_METHODS = ("caa", "cast", "mera", "sadi", "iti", "austeer")
 JSERVO_CONTROLS = {
     "targeted",
     "fixed_strength",
@@ -57,6 +57,7 @@ class FailureSteeringManifest:
     train_task_ids: tuple[str, ...]
     validation_task_ids: tuple[str, ...]
     evaluation_task_ids: tuple[str, ...]
+    enabled_methods: tuple[str, ...]
     tool_schema_path: Path | None = None
 
     @property
@@ -65,7 +66,7 @@ class FailureSteeringManifest:
 
 
 def load_failure_steering_manifest(path: str | Path) -> FailureSteeringManifest:
-    """Validate remote-only execution, disjoint splits, and Core-7 contracts."""
+    """Validate remote-only execution, disjoint splits, and baseline contracts."""
     resolved = Path(path).expanduser().resolve()
     raw = json.loads(resolved.read_text(encoding="utf-8"))
     if raw.get("schema_version") != FAILURE_STEERING_SCHEMA:
@@ -125,6 +126,14 @@ def load_failure_steering_manifest(path: str | Path) -> FailureSteeringManifest:
     ):
         raise ValueError("train, validation, and evaluation task IDs must be disjoint")
 
+    enabled_methods = _string_ids(
+        raw.get("enabled_methods", list(CORE_METHODS)),
+        label="enabled_methods",
+    )
+    unknown_enabled = set(enabled_methods) - set(CORE_METHODS)
+    if unknown_enabled:
+        raise ValueError(f"unknown enabled steering methods: {sorted(unknown_enabled)}")
+
     modes = raw.get("failure_modes")
     if not isinstance(modes, dict) or not modes:
         raise ValueError("failure_modes must be a non-empty object")
@@ -141,8 +150,8 @@ def load_failure_steering_manifest(path: str | Path) -> FailureSteeringManifest:
         if not isinstance(methods, dict) or not methods:
             raise ValueError(f"failure_modes.{category}.methods is required")
         for method, specification in methods.items():
-            if method not in CORE_METHODS:
-                raise ValueError(f"unknown steering method {method!r}")
+            if method not in enabled_methods:
+                raise ValueError(f"method {method!r} is not listed in enabled_methods")
             seen_methods.add(method)
             if not isinstance(specification, dict):
                 raise ValueError(f"{category}.{method} must be an object")
@@ -162,9 +171,9 @@ def load_failure_steering_manifest(path: str | Path) -> FailureSteeringManifest:
                 or not all(isinstance(item, (int, float)) for item in strengths)
             ):
                 raise ValueError(f"{category}.{method}.strengths must be numeric")
-    missing = set(CORE_METHODS) - seen_methods
+    missing = set(enabled_methods) - seen_methods
     if missing:
-        raise ValueError(f"manifest must cover every Core-7 method; missing {sorted(missing)}")
+        raise ValueError(f"manifest must cover every configured method; missing {sorted(missing)}")
     adaptive = raw.get("adaptive_controller")
     if adaptive is not None:
         if not isinstance(adaptive, dict) or not isinstance(
@@ -191,6 +200,7 @@ def load_failure_steering_manifest(path: str | Path) -> FailureSteeringManifest:
         train_task_ids=train,
         validation_task_ids=validation,
         evaluation_task_ids=evaluation,
+        enabled_methods=enabled_methods,
         tool_schema_path=tool_schema_path,
     )
 
@@ -234,7 +244,7 @@ def _condition(
 def compile_failure_steering_matrix(
     manifest: FailureSteeringManifest,
 ) -> dict[str, Any]:
-    """Expand Core-7 treatments and causal controls without fixed task turns."""
+    """Expand baseline treatments and causal controls without fixed task turns."""
     conditions = [
         _condition(
             manifest,

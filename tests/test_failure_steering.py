@@ -88,6 +88,30 @@ def test_manifest_compiles_all_core_methods_and_runtime_boundaries(tmp_path):
     } <= controls
 
 
+def test_manifest_compiles_only_explicitly_enabled_baselines(tmp_path):
+    value = _manifest()
+    enabled = ["caa", "mera", "sadi", "iti", "austeer"]
+    value["enabled_methods"] = enabled
+    for mode in value["failure_modes"].values():
+        mode["methods"] = {
+            method: specification
+            for method, specification in mode["methods"].items()
+            if method in enabled
+        }
+
+    manifest = load_failure_steering_manifest(_write(tmp_path, value))
+    matrix = compile_failure_steering_matrix(manifest)
+    targeted = {
+        item["method"]
+        for item in matrix["conditions"]
+        if item["control_type"] == "targeted"
+    }
+
+    assert manifest.enabled_methods == tuple(enabled)
+    assert targeted == set(enabled)
+    assert "cast" not in targeted
+
+
 def test_manifest_rejects_split_leakage_and_fixed_turns(tmp_path):
     value = _manifest()
     value["splits"]["evaluation_task_ids"] = ["1"]

@@ -26,4 +26,4 @@ def test_checked_protocol_is_implementation_ready():
     assert report["implementation_checks"]["remote_only_no_local_model"]["passed"]
     assert report["implementation_checks"]["official_airline_split"]["passed"]
     assert report["empirical_checks"]["taubench_reviewed_conditions"]["evidence"]["expected"] == 83
-    assert report["empirical_checks"]["toolalign_paired_analyses"]["evidence"]["expected"] == 16
+    assert report["empirical_checks"]["toolalign_paired_analyses"]["evidence"]["expected"] == 14

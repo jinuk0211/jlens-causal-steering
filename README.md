@@ -5,12 +5,15 @@ causally move both Jacobian-lens readouts and downstream ToolAlign behavior.
 It is separate from ToolAlignBench and uses its public prompts, tool taxonomy,
 and XML system prompt unchanged.
 
-The complete Core-7 integration (CAA, CAST, MERA, SADI, ITI, AUSteer, and
-LoReFT) and runnable ToolAlign aligned/abliterated plus TauBench Airline Task
+The complete Core-6 integration (CAA, CAST, MERA, SADI, ITI, and AUSteer) and
+runnable ToolAlign aligned/abliterated plus TauBench Airline Task
 18 protocols are in [STEERING_EXPERIMENTS.md](STEERING_EXPERIMENTS.md).
 
 The generic, remote-only failure-mode protocol that replaces fixed Task-18
 turn selection is in [FAILURE_MODE_STEERING.md](FAILURE_MODE_STEERING.md).
+
+The fresh Vast.ai commands for the Qwen3.5-4B five-baseline TauBench run are in
+[VAST_BASELINES5_QWEN35_4B.md](VAST_BASELINES5_QWEN35_4B.md).
 
 ## Experimental design
 

@@ -1,4 +1,4 @@
-"""Audit implementation and empirical readiness for the Core-7 benchmark protocol."""
+"""Audit implementation and empirical readiness for the baseline benchmark protocol."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-CORE_METHODS = ("caa", "cast", "mera", "sadi", "iti", "austeer", "loreft")
+CORE_METHODS = ("caa", "cast", "mera", "sadi", "iti", "austeer")
 STRUCTURAL_BOUNDARIES = {
     "after_tool_error",
     "after_repeated_tool_error",
@@ -23,7 +23,6 @@ EXPECTED_CONTROLS = {
     "sadi": {"targeted", "wrong_category", "zero_dose"},
     "iti": {"targeted", "negative_direction", "wrong_category"},
     "austeer": {"targeted", "negative_direction", "wrong_category"},
-    "loreft": {"targeted", "wrong_category", "zero_dose"},
 }
 EXPECTED_JSERVO_CONTROLS = {
     "targeted",

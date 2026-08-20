@@ -337,46 +337,9 @@ the five payment bindings, reward gain, active turn, and scalar dose.
 Configs: `configs/toolalign_austeer_llama8b.json` and
 `configs/taubench_task18_austeer.json`. Commands use the `*-austeer` suffixes.
 
-## LoReFT learned low-rank intervention
-
-LoReFT follows `stanfordnlp/pyreft` commit
-`dafd0995a366d7b47160a337dcc388eda7431821` and its exact formula:
-
-```text
-h' = h + (W h + b - h R) R^T,  with R^T R = I
-```
-
-The base LM is frozen. Rank-1/4/8 intervention parameters train on positive
-response LM loss, and the epoch is selected by a disjoint held-out response
-split. The default intervention changes only the last prompt token. Identity,
-rank-matched random initialization, and a labelled decode extension are
-controls.
-
-ToolAlign sequence:
-
-```powershell
-python -m jlens_causal.steering_cli validate-toolalign-loreft configs\toolalign_loreft_llama8b.json
-python -m jlens_causal.steering_cli toolalign-baseline-loreft configs\toolalign_loreft_llama8b.json --role aligned
-python -m jlens_causal.steering_cli toolalign-baseline-loreft configs\toolalign_loreft_llama8b.json --role abliterated
-python -m jlens_causal.steering_cli toolalign-train-loreft configs\toolalign_loreft_llama8b.json --role aligned
-python -m jlens_causal.steering_cli toolalign-train-loreft configs\toolalign_loreft_llama8b.json --role abliterated
-python -m jlens_causal.steering_cli toolalign-sweep-loreft configs\toolalign_loreft_llama8b.json --role aligned
-python -m jlens_causal.steering_cli toolalign-sweep-loreft configs\toolalign_loreft_llama8b.json --role abliterated
-```
-
-TauBench sequence:
-
-```powershell
-python -m jlens_causal.steering_cli validate-taubench-loreft configs\taubench_task18_loreft.json
-python -m jlens_causal.steering_cli taubench-train-loreft configs\taubench_task18_loreft.json
-cd D:\jlens\tau2-bench
-python scripts\run_airline_task18_loreft.py D:\jlens\jlens-causal-steering\configs\taubench_task18_loreft.json --condition list
-python scripts\analyze_airline_task18_loreft.py D:\jlens\jlens-causal-steering\configs\taubench_task18_loreft.json
-```
-
 ## Current execution status
 
-Every TauBench Core-7 analyzer also uses the benchmark's explicit
+Every TauBench Core-6 analyzer also uses the benchmark's explicit
 `ToolMessage.error` field and a shared canonical tool-call fingerprint. The
 JSON and CSV outputs include tool errors, unresolved calls, identical retries,
 short A-B-A-B loops, max-step termination, and positive-is-better reductions

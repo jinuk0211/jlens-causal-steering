@@ -1,4 +1,4 @@
-"""Combine paired aligned/abliterated transition analyses for all Core-7 methods."""
+"""Combine paired aligned/abliterated transition analyses for all baseline methods."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-METHODS = ("caa", "cast", "mera", "sadi", "iti", "austeer", "loreft")
+METHODS = ("caa", "cast", "mera", "sadi", "iti", "austeer")
 ROLES = ("aligned", "abliterated")
 
 
@@ -110,7 +110,7 @@ def collect_core7(
             raise ValueError(f"aligned/abliterated config fingerprint mismatch for {method}")
     if missing and not allow_partial:
         raise FileNotFoundError(
-            f"Core-7 summary requires all {len(METHODS) * len(ROLES)} analyses; "
+            f"Core-6 summary requires all {len(METHODS) * len(ROLES)} analyses; "
             f"missing {len(missing)} (first: {missing[0]})"
         )
     return {

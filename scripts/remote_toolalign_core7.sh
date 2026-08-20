@@ -7,8 +7,8 @@ ROLE="${3:-both}"
 STEERING_ROOT="${STEERING_ROOT:-/workspace/jlens-causal-steering}"
 
 case "${METHOD}" in
-  caa|cast|mera|sadi|iti|austeer|loreft) ;;
-  *) echo "method must be caa|cast|mera|sadi|iti|austeer|loreft" >&2; exit 2 ;;
+  caa|cast|mera|sadi|iti|austeer) ;;
+  *) echo "method must be caa|cast|mera|sadi|iti|austeer" >&2; exit 2 ;;
 esac
 case "${PHASE}" in
   validate|baseline|extract|sweep|analyze|full) ;;
@@ -52,13 +52,7 @@ run_role_phase() {
       command="toolalign-baseline"
       [[ "${METHOD}" != "caa" ]] && command="toolalign-baseline-${METHOD}"
       ;;
-    extract)
-      if [[ "${METHOD}" == "loreft" ]]; then
-        command="toolalign-train-loreft"
-      else
-        command="toolalign-extract-${METHOD}"
-      fi
-      ;;
+    extract) command="toolalign-extract-${METHOD}" ;;
     sweep) command="toolalign-sweep-${METHOD}" ;;
     analyze) command="toolalign-analyze-${METHOD}" ;;
     *) echo "unsupported role phase ${phase}" >&2; exit 2 ;;

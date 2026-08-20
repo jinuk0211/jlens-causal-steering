@@ -12,7 +12,6 @@ from jlens_causal.steering_config import (
     load_toolalign_caa_config,
     load_toolalign_cast_config,
     load_toolalign_iti_config,
-    load_toolalign_loreft_config,
     load_toolalign_mera_config,
     load_toolalign_sadi_config,
 )
@@ -31,10 +30,6 @@ from jlens_causal.taubench_cast import (
 from jlens_causal.taubench_iti import (
     extract_taubench_task18_iti,
     load_taubench_iti_config,
-)
-from jlens_causal.taubench_loreft import (
-    load_taubench_loreft_config,
-    train_taubench_task18_loreft,
 )
 from jlens_causal.taubench_mera import (
     extract_taubench_task18_mera,
@@ -68,11 +63,6 @@ from jlens_causal.toolalign_iti import (
     extract_toolalign_iti,
     run_toolalign_iti_sweep,
 )
-from jlens_causal.toolalign_loreft import (
-    analyze_toolalign_loreft,
-    run_toolalign_loreft_sweep,
-    train_toolalign_loreft,
-)
 from jlens_causal.toolalign_mera import (
     analyze_toolalign_mera,
     extract_toolalign_mera,
@@ -92,7 +82,7 @@ def _print(value: Any) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-steering",
-        description="Run CAA and later Core-7 baselines on agent benchmarks.",
+        description="Run published steering baselines on agent benchmarks.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     validate = commands.add_parser("validate-toolalign-caa")
@@ -217,33 +207,6 @@ def _parser() -> argparse.ArgumentParser:
     analyze_austeer.add_argument(
         "--role", required=True, choices=["aligned", "abliterated"]
     )
-    validate_loreft = commands.add_parser("validate-toolalign-loreft")
-    validate_loreft.add_argument("config")
-    baseline_loreft = commands.add_parser("toolalign-baseline-loreft")
-    baseline_loreft.add_argument("config")
-    baseline_loreft.add_argument(
-        "--role", required=True, choices=["aligned", "abliterated"]
-    )
-    baseline_loreft.add_argument("--limit", type=int)
-    pairs_loreft = commands.add_parser("toolalign-pairs-loreft")
-    pairs_loreft.add_argument("config")
-    train_loreft = commands.add_parser("toolalign-train-loreft")
-    train_loreft.add_argument("config")
-    train_loreft.add_argument(
-        "--role", required=True, choices=["aligned", "abliterated"]
-    )
-    train_loreft.add_argument("--force", action="store_true")
-    sweep_loreft = commands.add_parser("toolalign-sweep-loreft")
-    sweep_loreft.add_argument("config")
-    sweep_loreft.add_argument(
-        "--role", required=True, choices=["aligned", "abliterated"]
-    )
-    sweep_loreft.add_argument("--limit", type=int)
-    analyze_loreft = commands.add_parser("toolalign-analyze-loreft")
-    analyze_loreft.add_argument("config")
-    analyze_loreft.add_argument(
-        "--role", required=True, choices=["aligned", "abliterated"]
-    )
     validate_tau = commands.add_parser("validate-taubench-caa")
     validate_tau.add_argument("config")
     extract_tau = commands.add_parser("taubench-extract-caa")
@@ -274,116 +237,11 @@ def _parser() -> argparse.ArgumentParser:
     extract_tau_austeer = commands.add_parser("taubench-extract-austeer")
     extract_tau_austeer.add_argument("config")
     extract_tau_austeer.add_argument("--force", action="store_true")
-    validate_tau_loreft = commands.add_parser("validate-taubench-loreft")
-    validate_tau_loreft.add_argument("config")
-    train_tau_loreft = commands.add_parser("taubench-train-loreft")
-    train_tau_loreft.add_argument("config")
-    train_tau_loreft.add_argument("--force", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.command in {"validate-taubench-loreft", "taubench-train-loreft"}:
-        tau_loreft_config = load_taubench_loreft_config(args.config)
-        if args.command == "validate-taubench-loreft":
-            _print(
-                {
-                    "config": str(tau_loreft_config.path),
-                    "model": tau_loreft_config.model,
-                    "source_meta_path": str(tau_loreft_config.source_meta_path),
-                    "behavior_source_config": str(
-                        tau_loreft_config.behavior_config.path
-                    ),
-                    "task_id": tau_loreft_config.raw["task_id"],
-                    "causal_turn_index": tau_loreft_config.raw[
-                        "causal_turn_index"
-                    ],
-                    "causal_boundary": tau_loreft_config.raw["causal_boundary"],
-                    "layers": tau_loreft_config.training["layers"],
-                    "ranks": tau_loreft_config.training["ranks"],
-                    "train_pair_indices": tau_loreft_config.training[
-                        "train_pair_indices"
-                    ],
-                    "validation_pair_indices": tau_loreft_config.training[
-                        "validation_pair_indices"
-                    ],
-                    "output_dir": str(tau_loreft_config.output_dir),
-                    "source": tau_loreft_config.raw["source"],
-                    "status": "valid",
-                }
-            )
-            return 0
-        runtime = load_hf_runtime(tau_loreft_config.model)
-        _print(
-            train_taubench_task18_loreft(
-                tau_loreft_config, runtime, force=args.force
-            )
-        )
-        return 0
-    if args.command in {
-        "validate-toolalign-loreft",
-        "toolalign-baseline-loreft",
-        "toolalign-pairs-loreft",
-        "toolalign-train-loreft",
-        "toolalign-sweep-loreft",
-        "toolalign-analyze-loreft",
-    }:
-        loreft_config = load_toolalign_loreft_config(args.config)
-        if args.command == "validate-toolalign-loreft":
-            selections = {}
-            for split in ("calibration", "reft_validation", "evaluation"):
-                _, cases = _selected_cases(loreft_config, split=split)
-                selections[split] = len(cases)
-            _print(
-                {
-                    "config": str(loreft_config.path),
-                    "config_fingerprint": loreft_config.config_fingerprint,
-                    "toolalign_root": str(loreft_config.toolalign_root),
-                    "output_dir": str(loreft_config.output_dir),
-                    "selected_cases": selections,
-                    "layers": loreft_config.training["layers"],
-                    "ranks": loreft_config.training["ranks"],
-                    "source": loreft_config.raw["source"],
-                    "status": "valid",
-                }
-            )
-            return 0
-        if args.command == "toolalign-pairs-loreft":
-            _print(
-                {
-                    split: divergent_response_pairs(loreft_config, split=split)
-                    for split in ("calibration", "reft_validation")
-                }
-            )
-            return 0
-        role = args.role
-        if args.command == "toolalign-analyze-loreft":
-            _print(analyze_toolalign_loreft(loreft_config, role=role))
-            return 0
-        runtime = load_hf_runtime(loreft_config.models[role])
-        if args.command == "toolalign-baseline-loreft":
-            _print(
-                run_baseline_rollouts(
-                    loreft_config, runtime, role=role, limit=args.limit
-                )
-            )
-            return 0
-        if args.command == "toolalign-train-loreft":
-            _print(
-                train_toolalign_loreft(
-                    loreft_config, runtime, role=role, force=args.force
-                )
-            )
-            return 0
-        if args.command == "toolalign-sweep-loreft":
-            _print(
-                run_toolalign_loreft_sweep(
-                    loreft_config, runtime, role=role, limit=args.limit
-                )
-            )
-            return 0
-        raise AssertionError(f"unhandled LoReFT command {args.command}")
     if args.command in {"validate-taubench-austeer", "taubench-extract-austeer"}:
         tau_austeer_config = load_taubench_austeer_config(args.config)
         if args.command == "validate-taubench-austeer":

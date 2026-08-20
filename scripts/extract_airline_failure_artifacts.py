@@ -17,7 +17,6 @@ from jlens_causal.failure_core_extractors import (
     extract_failure_mera,
     extract_failure_sadi,
 )
-from jlens_causal.failure_loreft import train_failure_loreft
 from jlens_causal.failure_steering import load_failure_steering_manifest
 from jlens_causal.jservo import extract_failure_jservo
 from jlens_causal.modeling import load_hf_runtime
@@ -47,7 +46,6 @@ def main() -> int:
             "sadi",
             "iti",
             "austeer",
-            "loreft",
             "jservo",
             "all",
         ],
@@ -73,9 +71,6 @@ def main() -> int:
     parser.add_argument("--top-k", type=int)
     parser.add_argument("--protected-k", type=int, default=8)
     parser.add_argument("--minimum-consistency", type=float, default=0.7)
-    parser.add_argument("--ranks", nargs="+", type=int, default=[4])
-    parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     manifest = load_failure_steering_manifest(args.manifest)
@@ -99,11 +94,10 @@ def main() -> int:
         "output_dir": args.output_dir,
         "tools": tools,
     }
-    methods = (
-        ["caa", "cast", "mera", "sadi", "iti", "austeer", "loreft"]
-        if args.method == "all"
-        else [args.method]
-    )
+    methods = list(manifest.enabled_methods) if args.method == "all" else [args.method]
+    disabled = set(methods) - set(manifest.enabled_methods)
+    if disabled:
+        parser.error(f"methods are disabled by the manifest: {sorted(disabled)}")
     if "cast" in methods and args.condition_pairs is None:
         parser.error("cast and all require --condition-pairs")
     condition_pairs = (
@@ -161,20 +155,7 @@ def main() -> int:
                 **common, top_k=args.top_k or 100, force=args.force
             )
         else:
-            result = train_failure_loreft(
-                runtime,
-                pairs,
-                model_id=model["model_id"],
-                model_revision=model["model_revision"],
-                failure_category=args.category,
-                layers=args.layers,
-                ranks=args.ranks,
-                output_dir=args.output_dir,
-                tools=tools,
-                epochs=args.epochs,
-                learning_rate=args.learning_rate,
-                force=args.force,
-            )
+            raise AssertionError(f"unhandled artifact method {method}")
         results[method] = result
         print(json.dumps({method: result}, ensure_ascii=False, indent=2, sort_keys=True))
     if len(results) > 1:

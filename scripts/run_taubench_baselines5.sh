@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# End-to-end, restartable TauBench Airline Core-7 run:
-# repairs -> seven artifacts -> validation selection -> frozen evaluation.
+# Restartable TauBench Airline five-baseline run after no-steering data collection:
+# repairs -> five artifacts -> validation selection -> frozen evaluation.
 
 set -Eeuo pipefail
 
 CAUSAL_ROOT="${CAUSAL_ROOT:-/workspace/jlens-causal-steering}"
 TAU2_ROOT="${TAU2_ROOT:-/workspace/tau2-bench}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/workspace/jlens-artifacts/taubench-airline/retry}"
-PREFIX="${PREFIX:-failure-steering-lean266-v1}"
+PREFIX="${PREFIX:-failure-steering-baselines5-v1}"
+BASELINE_PREFIX="${BASELINE_PREFIX:-failure-steering}"
+FAILURE_CATEGORY="retry_without_state_change"
 REVIEW_MODEL="${REVIEW_MODEL:-gpt-4.1-2025-04-14}"
 USER_MODEL="${USER_MODEL:-gpt-5.2-2025-12-11}"
 PROPOSAL_MODEL="${PROPOSAL_MODEL:-gpt-5.2}"
@@ -25,15 +27,14 @@ EVENTS="${AUDIT_DIR}/failure-events.jsonl"
 REPAIRS="${CAUSAL_ROOT}/outputs/taubench-airline-repairs.jsonl"
 REPAIR_REPORT="${CAUSAL_ROOT}/outputs/taubench-airline-repairs.report.json"
 REPAIR_PAIRS="${CAUSAL_ROOT}/outputs/taubench-airline-repair-pairs.jsonl"
-CAST_PAIRS="${CAUSAL_ROOT}/outputs/taubench-airline-cast-condition-pairs.jsonl"
 RESULTS_ROOT="data/simulations/${PREFIX}"
 TELEMETRY_ROOT="data/jlens-telemetry/${PREFIX}"
 ANALYSIS_ROOT="data/analysis/${PREFIX}"
-RUN_LOG="${RUN_LOG:-/workspace/taubench-core7-lean266.log}"
-WORKER_LOG="${WORKER_LOG:-/workspace/jlens-remote-worker-lean266.log}"
+RUN_LOG="${RUN_LOG:-/workspace/taubench-baselines5.log}"
+WORKER_LOG="${WORKER_LOG:-/workspace/jlens-remote-worker-baselines5.log}"
 
-TRAIN_REVIEWED="${TAU2_ROOT}/data/simulations/failure-steering/train/baseline/results_reviewed.json"
-VALIDATION_REVIEWED="${TAU2_ROOT}/data/simulations/failure-steering/validation/baseline/results_reviewed.json"
+TRAIN_REVIEWED="${TAU2_ROOT}/data/simulations/${BASELINE_PREFIX}/train/baseline/results_reviewed.json"
+VALIDATION_REVIEWED="${TAU2_ROOT}/data/simulations/${BASELINE_PREFIX}/validation/baseline/results_reviewed.json"
 
 die() {
   echo "ERROR: $*" >&2
@@ -87,12 +88,47 @@ python -m jlens_causal.failure_cli audit \
   --output-dir "$AUDIT_DIR" \
   2>&1 | tee -a "$RUN_LOG"
 
+python - "$EVENTS" "$MANIFEST" "$FAILURE_CATEGORY" <<'PY' \
+  2>&1 | tee -a "$RUN_LOG"
+import json
+import sys
+from collections import Counter
+
+events_path, manifest_path, category = sys.argv[1:]
+manifest = json.load(open(manifest_path, encoding="utf-8"))
+split_by_task = {
+    str(task_id): split
+    for split in ("train", "validation")
+    for task_id in manifest["splits"][f"{split}_task_ids"]
+}
+counts = Counter()
+inventory = Counter()
+with open(events_path, encoding="utf-8") as handle:
+    for line in handle:
+        event = json.loads(line)
+        split = split_by_task.get(str(event.get("task_id")))
+        if split and event.get("steerable") and event.get("first_bad_message_index") is not None:
+            inventory[(str(event.get("category")), split)] += 1
+            if event.get("category") == category and float(event.get("confidence", 0.0)) >= 0.5:
+                counts[split] += 1
+print("eligible structural/review event inventory:")
+for (name, split), count in sorted(inventory.items()):
+    print(f"  {name:36s} {split:10s} {count}")
+print(f"selected category {category!r}: train={counts['train']} validation={counts['validation']}")
+if counts["train"] < 2 or counts["validation"] < 2:
+    raise SystemExit(
+        "Need at least two eligible events in both train and validation. "
+        "Rerun the no-steering collection with larger BASELINE_TRAIN_TRIALS and "
+        "BASELINE_VALIDATION_TRIALS before artifact extraction."
+    )
+PY
+
 echo "===== Generate and validate counterfactual repairs =====" | tee -a "$RUN_LOG"
 python -u -m jlens_causal.failure_cli repairs \
   "$MERGED" \
   "$EVENTS" \
   "$MANIFEST" \
-  --category retry_without_state_change \
+  --category "$FAILURE_CATEGORY" \
   --output "$REPAIRS" \
   --report "$REPAIR_REPORT" \
   --pairs-output "$REPAIR_PAIRS" \
@@ -105,32 +141,61 @@ python -u -m jlens_causal.failure_cli repairs \
   --review-tpm 27000 \
   2>&1 | tee -a "$RUN_LOG"
 
-python -m jlens_causal.failure_cli cast-conditions \
-  "$MERGED" \
-  "$EVENTS" \
-  "$MANIFEST" \
-  --category retry_without_state_change \
-  --output "$CAST_PAIRS" \
-  2>&1 | tee -a "$RUN_LOG"
-
 python -m jlens_causal.failure_cli compile \
   "$MANIFEST" \
   --output "$MATRIX" \
   2>&1 | tee -a "$RUN_LOG"
 
 require_file "$REPAIR_PAIRS"
-require_file "$CAST_PAIRS"
 require_file "$MATRIX"
 
 ARTIFACTS=(
   "$ARTIFACT_ROOT/caa-layer-20.pt"
-  "$ARTIFACT_ROOT/cast-layer-20.pt"
   "$ARTIFACT_ROOT/mera-layer-20.pt"
   "$ARTIFACT_ROOT/sadi-hidden-units.pt"
   "$ARTIFACT_ROOT/iti-heads.pt"
   "$ARTIFACT_ROOT/austeer-attention-aus.pt"
-  "$ARTIFACT_ROOT/loreft-rank-4.pt"
 )
+
+validate_artifacts() {
+  python - "$ARTIFACT_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+import torch
+
+from jlens_causal.baselines import (
+    load_austeer_artifact,
+    load_caa_artifact,
+    load_iti_artifact,
+    load_mera_artifact,
+    load_sadi_artifact,
+)
+
+root = Path(sys.argv[1])
+model_id = "Qwen/Qwen3.5-4B"
+load_caa_artifact(
+    torch,
+    root / "caa-layer-20.pt",
+    expected_model_id=model_id,
+    expected_layer=20,
+)
+load_mera_artifact(
+    torch,
+    root / "mera-layer-20.pt",
+    expected_model_id=model_id,
+    expected_layer=20,
+)
+load_sadi_artifact(torch, root / "sadi-hidden-units.pt", expected_model_id=model_id)
+load_iti_artifact(torch, root / "iti-heads.pt", expected_model_id=model_id)
+load_austeer_artifact(
+    torch,
+    root / "austeer-attention-aus.pt",
+    expected_model_id=model_id,
+)
+print("Validated all five baseline artifacts")
+PY
+}
 
 ARTIFACTS_READY=1
 for artifact in "${ARTIFACTS[@]}"; do
@@ -139,28 +204,28 @@ for artifact in "${ARTIFACTS[@]}"; do
     break
   fi
 done
+if [[ "$ARTIFACTS_READY" == 1 ]] && ! validate_artifacts; then
+  ARTIFACTS_READY=0
+fi
 
 if [[ "$ARTIFACTS_READY" == 1 ]]; then
-  echo "===== Core-7 artifacts already complete =====" | tee -a "$RUN_LOG"
+  echo "===== Five baseline artifacts already complete =====" | tee -a "$RUN_LOG"
 else
-  echo "===== Extract all seven Core-7 artifacts (one model load) =====" | tee -a "$RUN_LOG"
+  echo "===== Extract five baseline artifacts (one model load) =====" | tee -a "$RUN_LOG"
   python scripts/extract_airline_failure_artifacts.py all \
     "$MANIFEST" \
     "$REPAIR_PAIRS" \
-    --category retry_without_state_change \
+    --category "$FAILURE_CATEGORY" \
     --layers 20 24 \
-    --condition-layers 16 20 24 \
-    --condition-pairs "$CAST_PAIRS" \
     --tools-json "$TOOLS_JSON" \
     --output-dir "$ARTIFACT_ROOT" \
-    --ranks 4 \
-    --epochs 8 \
     2>&1 | tee -a "$RUN_LOG"
 fi
 
 for artifact in "${ARTIFACTS[@]}"; do
   require_file "$artifact"
 done
+validate_artifacts 2>&1 | tee -a "$RUN_LOG"
 
 echo "===== Start authenticated local GPU worker =====" | tee -a "$RUN_LOG"
 WORKER_PORT="$(
@@ -206,11 +271,13 @@ if [[ "$WORKER_READY" != 1 ]]; then
   die "worker readiness timeout"
 fi
 
-python scripts/preflight_failure_steering.py \
-  "$MATRIX" \
-  --method all \
-  --require-hf-token \
-  2>&1 | tee -a "$RUN_LOG"
+for method in caa mera sadi iti austeer; do
+  python scripts/preflight_failure_steering.py \
+    "$MATRIX" \
+    --method "$method" \
+    --require-hf-token \
+    2>&1 | tee -a "$RUN_LOG"
+done
 
 review_valid() {
   local results="$1"
@@ -242,7 +309,7 @@ PY
 
 echo "===== Copy verified baselines into lean run namespace =====" | tee -a "$RUN_LOG"
 for split in validation evaluation; do
-  source_baseline="data/simulations/failure-steering/${split}/baseline"
+  source_baseline="data/simulations/${BASELINE_PREFIX}/${split}/baseline"
   target_parent="${RESULTS_ROOT}/${split}"
   target_baseline="${target_parent}/baseline"
   require_file "${source_baseline}/results.json"
@@ -311,9 +378,6 @@ VALIDATION_CONDITIONS=(
   retry_without_state_change-caa-s0.5
   retry_without_state_change-caa-s1
   retry_without_state_change-caa-s2
-  retry_without_state_change-cast-s0.5
-  retry_without_state_change-cast-s1
-  retry_without_state_change-cast-s2
   retry_without_state_change-mera-s0.5
   retry_without_state_change-mera-s1
   retry_without_state_change-mera-s2
@@ -326,9 +390,6 @@ VALIDATION_CONDITIONS=(
   retry_without_state_change-austeer-s5
   retry_without_state_change-austeer-s10
   retry_without_state_change-austeer-s15
-  retry_without_state_change-loreft-s0.5
-  retry_without_state_change-loreft-s1
-  retry_without_state_change-loreft-s2
 )
 
 for condition in "${VALIDATION_CONDITIONS[@]}"; do
@@ -350,7 +411,7 @@ import math
 import sys
 
 data = json.load(open(sys.argv[1], encoding="utf-8"))
-methods = ["caa", "cast", "mera", "sadi", "iti", "austeer", "loreft"]
+methods = ["caa", "mera", "sadi", "iti", "austeer"]
 
 def number(value):
     return -math.inf if value is None else float(value)
@@ -380,10 +441,10 @@ for method in methods:
 PY
 )
 
-[[ "${#EVALUATION_CONDITIONS[@]}" -eq 7 ]] \
-  || die "expected seven selected evaluation conditions"
+[[ "${#EVALUATION_CONDITIONS[@]}" -eq 5 ]] \
+  || die "expected five selected evaluation conditions"
 printf '%s\n' "${EVALUATION_CONDITIONS[@]}" \
-  | tee /workspace/core7-selected-conditions.txt \
+  | tee /workspace/baselines5-selected-conditions.txt \
   | tee -a "$RUN_LOG"
 
 for condition in "${EVALUATION_CONDITIONS[@]}"; do
@@ -398,10 +459,10 @@ python scripts/analyze_airline_failure_steering.py \
   --output-dir "$ANALYSIS_ROOT" \
   2>&1 | tee -a "$RUN_LOG"
 
-echo "Lean Core-7 complete" | tee -a "$RUN_LOG"
-echo "Validation: 21 conditions x 6 tasks = 126" | tee -a "$RUN_LOG"
-echo "Evaluation: 7 selected conditions x 20 tasks = 140" | tee -a "$RUN_LOG"
-echo "Total: 266 trajectories" | tee -a "$RUN_LOG"
-echo "Selected conditions: /workspace/core7-selected-conditions.txt" | tee -a "$RUN_LOG"
+echo "Five-baseline run complete" | tee -a "$RUN_LOG"
+echo "Validation: 15 conditions x 6 tasks = 90" | tee -a "$RUN_LOG"
+echo "Evaluation: 5 selected conditions x 20 tasks = 100" | tee -a "$RUN_LOG"
+echo "Total steered: 190 trajectories" | tee -a "$RUN_LOG"
+echo "Selected conditions: /workspace/baselines5-selected-conditions.txt" | tee -a "$RUN_LOG"
 echo "Analysis: ${TAU2_ROOT}/${ANALYSIS_ROOT}" | tee -a "$RUN_LOG"
 echo "Log: ${RUN_LOG}" | tee -a "$RUN_LOG"

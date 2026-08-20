@@ -22,7 +22,6 @@ from jlens_causal.interventions import (
     cast_generation_hook,
     generation_intervention_hook,
     iti_generation_hooks,
-    loreft_generation_hooks,
     mera_generation_hook,
     sadi_generation_hooks,
 )
@@ -39,7 +38,6 @@ from jlens_causal.steering_config import (
     ToolAlignCAAConfig,
     ToolAlignCASTConfig,
     ToolAlignITIConfig,
-    ToolAlignLoReFTConfig,
     ToolAlignMERAConfig,
     ToolAlignSADIConfig,
 )
@@ -152,20 +150,6 @@ class AUSteerRolloutIntervention:
 
 
 @dataclass(frozen=True)
-class LoReFTRolloutIntervention:
-    """A trained LoReFT residual subspace at the final prompt token."""
-
-    method: str
-    parameters_by_layer: dict[int, tuple[Any, Any, Any]]
-    rank: int
-    vector_fingerprint: str
-    scale: float = 1.0
-    apply_decode: bool = False
-    step_indices: tuple[int, ...] = ()
-    control_seed: int | None = None
-
-
-@dataclass(frozen=True)
 class JServoRolloutIntervention:
     """Failure-mode adaptive J-space controller for a full ToolAlign rollout."""
 
@@ -267,7 +251,6 @@ def _intervention_context(
         | SadiRolloutIntervention
         | ItiRolloutIntervention
         | AUSteerRolloutIntervention
-        | LoReFTRolloutIntervention
         | JServoRolloutIntervention
         | None
     ),
@@ -348,13 +331,6 @@ def _intervention_context(
             prefill_mode=intervention.prefill_mode,
             apply_decode=intervention.apply_decode,
         )
-    elif isinstance(intervention, LoReFTRolloutIntervention):
-        context = loreft_generation_hooks(
-            runtime.lens_model.layers,
-            parameters_by_layer=intervention.parameters_by_layer,
-            scale=intervention.scale,
-            apply_decode=intervention.apply_decode,
-        )
     else:
         context = generation_intervention_hook(
             runtime.lens_model.layers,
@@ -421,7 +397,6 @@ def run_toolalign_rollout(
         | SadiRolloutIntervention
         | ItiRolloutIntervention
         | AUSteerRolloutIntervention
-        | LoReFTRolloutIntervention
         | JServoRolloutIntervention
         | None
     ) = None,
@@ -608,8 +583,7 @@ def _selected_cases(
     | ToolAlignMERAConfig
     | ToolAlignSADIConfig
     | ToolAlignITIConfig
-    | ToolAlignAUSteerConfig
-    | ToolAlignLoReFTConfig,
+    | ToolAlignAUSteerConfig,
     *,
     split: str,
 ) -> tuple[Any, list[ScenarioCase]]:
@@ -633,10 +607,6 @@ def _selected_cases(
     elif split == "au_validation":
         domains = data["au_validation_domains"]
         documents = data["au_validation_documents"]
-        scenario_types = ["wrongdoing"]
-    elif split == "reft_validation":
-        domains = data["reft_validation_domains"]
-        documents = data["reft_validation_documents"]
         scenario_types = ["wrongdoing"]
     elif split == "evaluation":
         domains = data["evaluation_domains"]
@@ -662,8 +632,7 @@ def run_baseline_rollouts(
     | ToolAlignMERAConfig
     | ToolAlignSADIConfig
     | ToolAlignITIConfig
-    | ToolAlignAUSteerConfig
-    | ToolAlignLoReFTConfig,
+    | ToolAlignAUSteerConfig,
     runtime: ModelRuntime,
     *,
     role: str,
@@ -685,8 +654,6 @@ def run_baseline_rollouts(
         splits.append("head_validation")
     if "au_validation_domains" in config.data:
         splits.append("au_validation")
-    if "reft_validation_domains" in config.data:
-        splits.append("reft_validation")
     splits.append("evaluation")
     for split in splits:
         common, cases = _selected_cases(config, split=split)
@@ -732,8 +699,7 @@ def divergent_calibration_pairs(
     | ToolAlignMERAConfig
     | ToolAlignSADIConfig
     | ToolAlignITIConfig
-    | ToolAlignAUSteerConfig
-    | ToolAlignLoReFTConfig,
+    | ToolAlignAUSteerConfig,
 ) -> list[dict[str, Any]]:
     """Select wrongdoing prompts where aligned and abliterated behavior differs."""
     return divergent_response_pairs(config, split="calibration")
@@ -745,8 +711,7 @@ def divergent_response_pairs(
     | ToolAlignMERAConfig
     | ToolAlignSADIConfig
     | ToolAlignITIConfig
-    | ToolAlignAUSteerConfig
-    | ToolAlignLoReFTConfig,
+    | ToolAlignAUSteerConfig,
     *,
     split: str,
 ) -> list[dict[str, Any]]:
