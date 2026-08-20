@@ -177,6 +177,10 @@ def test_qwen35_production_manifest_targets_tool_call_errors():
     ]
 
     assert set(manifest.raw["failure_modes"]) == {"tool_call_error"}
+    assert manifest.raw["generation"]["max_new_tokens"] == 4096
+    assert manifest.raw["generation"]["max_time"] == 300
+    assert all(item["agent_llm_args"]["max_new_tokens"] == 4096 for item in targeted)
+    assert all(item["agent_llm_args"]["max_time"] == 300 for item in targeted)
     assert {item["method"] for item in targeted} == enabled
     assert all(item["failure_category"] == "tool_call_error" for item in targeted)
     assert all(

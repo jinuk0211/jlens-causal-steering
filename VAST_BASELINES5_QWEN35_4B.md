@@ -219,6 +219,10 @@ The driver is restartable. After an SSH disconnect or recoverable API failure,
 run the same command again inside the same instance and workspace.
 Each individual simulation is capped at 1200 wallclock seconds by default;
 completed task/trial checkpoints are reused when the driver is restarted.
+Each Qwen turn keeps the 4096-new-token limit and is capped at 300 generation
+seconds. Infrastructure failures are retried once. The worker log emits a
+start message, 30-second heartbeats, and a completion message for every Qwen
+turn.
 
 ## 6. If the repair-pair gate stops the run
 
