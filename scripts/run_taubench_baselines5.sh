@@ -4,6 +4,10 @@
 
 set -Eeuo pipefail
 
+# Qwen3.5 can approach the 16 GiB boundary on max-token steering failures.
+# Expandable CUDA segments reduce fragmentation between sequential turns.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 CAUSAL_ROOT="${CAUSAL_ROOT:-/workspace/jlens-causal-steering}"
 TAU2_ROOT="${TAU2_ROOT:-/workspace/tau2-bench}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/workspace/jlens-artifacts/taubench-airline/tool-call-error}"
