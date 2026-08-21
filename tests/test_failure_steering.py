@@ -103,9 +103,7 @@ def test_manifest_compiles_only_explicitly_enabled_baselines(tmp_path):
     manifest = load_failure_steering_manifest(_write(tmp_path, value))
     matrix = compile_failure_steering_matrix(manifest)
     targeted = {
-        item["method"]
-        for item in matrix["conditions"]
-        if item["control_type"] == "targeted"
+        item["method"] for item in matrix["conditions"] if item["control_type"] == "targeted"
     }
 
     assert manifest.enabled_methods == tuple(enabled)
@@ -163,9 +161,7 @@ def test_tool_schema_fingerprint_is_independent_of_line_endings(tmp_path):
 
 def test_qwen35_production_manifest_targets_tool_call_errors():
     manifest_path = (
-        Path(__file__).parents[1]
-        / "configs"
-        / "taubench_airline_failure_modes_qwen35_4b.json"
+        Path(__file__).parents[1] / "configs" / "taubench_airline_failure_modes_qwen35_4b.json"
     )
     manifest = load_failure_steering_manifest(manifest_path)
     matrix = compile_failure_steering_matrix(manifest)
@@ -184,12 +180,32 @@ def test_qwen35_production_manifest_targets_tool_call_errors():
     assert {item["method"] for item in targeted} == enabled
     assert all(item["failure_category"] == "tool_call_error" for item in targeted)
     assert all(
-        item["agent_llm_args"]["jlens_intervention"]["boundaries"]
-        == ["after_tool_error"]
+        item["agent_llm_args"]["jlens_intervention"]["boundaries"] == ["after_tool_error"]
         for item in targeted
     )
     assert all(
-        "/tool-call-error/"
-        in item["agent_llm_args"]["jlens_intervention"]["vector_path"]
+        "/tool-call-error/" in item["agent_llm_args"]["jlens_intervention"]["vector_path"]
+        for item in targeted
+    )
+
+
+def test_qwen35_behavior_manifest_pools_review_failures_at_every_decision():
+    manifest_path = (
+        Path(__file__).parents[1] / "configs" / "taubench_airline_behavior_errors_qwen35_4b.json"
+    )
+    manifest = load_failure_steering_manifest(manifest_path)
+    matrix = compile_failure_steering_matrix(manifest)
+    targeted = [item for item in matrix["conditions"] if item["control_type"] == "targeted"]
+
+    assert set(manifest.raw["failure_modes"]) == {"agent_behavior_error"}
+    assert {item["method"] for item in targeted} == set(manifest.enabled_methods)
+    assert all(item["failure_category"] == "agent_behavior_error" for item in targeted)
+    assert all(
+        item["agent_llm_args"]["jlens_intervention"]["boundaries"]
+        == ["initial_decision", "after_user_message", "after_tool_result"]
+        for item in targeted
+    )
+    assert all(
+        "/agent-behavior-error/" in item["agent_llm_args"]["jlens_intervention"]["vector_path"]
         for item in targeted
     )

@@ -86,6 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     pairs.add_argument("repairs")
     pairs.add_argument("manifest")
     pairs.add_argument("--output", required=True)
+    pairs.add_argument("--output-category")
     repairs = commands.add_parser(
         "repairs",
         help="generate counterfactual repairs and validate them with Tau2 replay",
@@ -97,6 +98,21 @@ def _parser() -> argparse.ArgumentParser:
     repairs.add_argument("--report")
     repairs.add_argument("--pairs-output")
     repairs.add_argument("--category", default="retry_without_state_change")
+    repairs.add_argument(
+        "--categories",
+        nargs="+",
+        help="source failure categories to pool; defaults to --category",
+    )
+    repairs.add_argument(
+        "--output-category",
+        help="category label written to pooled repair pairs; defaults to --category",
+    )
+    repairs.add_argument(
+        "--seed-repairs",
+        action="append",
+        default=[],
+        help="reuse validated repair checkpoints from an earlier compatible run",
+    )
     repairs.add_argument("--proposal-model", default="gpt-5.2")
     repairs.add_argument("--review-model", default="gpt-4.1-2025-04-14")
     repairs.add_argument("--reasoning-effort", default="low")
@@ -176,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
             output=args.output,
             report=report_path,
             category=args.category,
+            categories=args.categories,
+            output_category=args.output_category,
             train_task_ids=manifest.train_task_ids,
             validation_task_ids=manifest.validation_task_ids,
             evaluation_task_ids=manifest.evaluation_task_ids,
@@ -184,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             minimum_per_split=args.minimum_per_split,
             maximum_per_split=args.maximum_per_split,
             overwrite=args.overwrite,
+            seed_repairs=[repair for path in args.seed_repairs for repair in read_repairs(path)],
         )
         summary: dict[str, Any] = {
             "output": str(Path(args.output).expanduser().resolve()),
@@ -199,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 train_task_ids=manifest.train_task_ids,
                 validation_task_ids=manifest.validation_task_ids,
                 evaluation_task_ids=manifest.evaluation_task_ids,
+                failure_category=args.output_category,
             )
             output = write_failure_response_pairs(args.pairs_output, pairs)
             summary["pairs_output"] = str(output)
@@ -239,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
             train_task_ids=manifest.train_task_ids,
             validation_task_ids=manifest.validation_task_ids,
             evaluation_task_ids=manifest.evaluation_task_ids,
+            failure_category=args.output_category,
         )
         output = write_failure_response_pairs(args.output, pairs)
         print(

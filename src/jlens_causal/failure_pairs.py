@@ -55,6 +55,7 @@ def build_failure_response_pairs(
     train_task_ids: Iterable[str],
     validation_task_ids: Iterable[str],
     evaluation_task_ids: Iterable[str],
+    failure_category: str | None = None,
 ) -> list[dict[str, Any]]:
     """Join externally validated repairs to localized train/validation failures."""
     split_by_task = {
@@ -116,6 +117,7 @@ def build_failure_response_pairs(
                 "repaired": repaired,
             }
         )[:24]
+        output_category = str(failure_category or repair.get("failure_category") or event.category)
         pairs.append(
             {
                 "schema_version": FAILURE_PAIR_SCHEMA,
@@ -124,7 +126,8 @@ def build_failure_response_pairs(
                 "simulation_id": event.simulation_id,
                 "task_id": event.task_id,
                 "split": split,
-                "failure_category": event.category,
+                "failure_category": output_category,
+                "source_failure_category": event.category,
                 "failure_confidence": event.confidence,
                 "context_messages": context,
                 "negative_failed_message": failed,

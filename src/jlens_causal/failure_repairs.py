@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Protocol
@@ -196,7 +197,9 @@ class Tau2AirlineRepairRuntime:
             for marker in ("rate", "429", "timeout", "tempor", "connection", "service unavailable")
         )
 
-    def _call(self, *, model: str, messages: list[Any], tools: list[Any] | None, **kwargs: Any) -> Any:
+    def _call(
+        self, *, model: str, messages: list[Any], tools: list[Any] | None, **kwargs: Any
+    ) -> Any:
         for retry in range(self.api_retries):
             try:
                 return self._generate(
@@ -210,7 +213,9 @@ class Tau2AirlineRepairRuntime:
                 if retry + 1 == self.api_retries or not self._transient(error):
                     raise
                 delay = min(60.0, 2.0 ** (retry + 1))
-                print(f"transient model error; retrying {model} in {delay:.0f}s: {error}", flush=True)
+                print(
+                    f"transient model error; retrying {model} in {delay:.0f}s: {error}", flush=True
+                )
                 time.sleep(delay)
         raise AssertionError("unreachable")
 
@@ -220,7 +225,10 @@ class Tau2AirlineRepairRuntime:
         while True:
             now = time.monotonic()
             self._review_usage = [item for item in self._review_usage if now - item[0] < 60]
-            if sum(tokens for _, tokens in self._review_usage) + estimated_tokens <= self.review_tpm:
+            if (
+                sum(tokens for _, tokens in self._review_usage) + estimated_tokens
+                <= self.review_tpm
+            ):
                 return
             wait = max(1.0, 60.0 - (now - self._review_usage[0][0]) + 0.2)
             print(f"review TPM guard: waiting {wait:.1f}s", flush=True)
@@ -229,7 +237,10 @@ class Tau2AirlineRepairRuntime:
     def propose(self, event: FailureEvent, attempt: int) -> dict[str, Any]:
         raw_simulation = self.raw_simulations[event.simulation_id]
         failed = raw_simulation["messages"][event.first_bad_message_index]
-        guidance = event.correct_behavior or "No reviewer-authored correction was available. Infer it from policy and visible history."
+        guidance = (
+            event.correct_behavior
+            or "No reviewer-authored correction was available. Infer it from policy and visible history."
+        )
         prompt = f"""You repair exactly one assistant decision in a Tau2 airline trajectory.
 Follow the airline policy. Return exactly one next assistant action: either one concise user-facing message or tool call(s). Do not mention this repair instruction, hidden labels, or future turns. Do not repeat an ineffective action unless the visible history contains new information or a state change that makes it valid.
 
@@ -245,7 +256,10 @@ proposal attempt: {attempt}
 """
         response = self._call(
             model=self.proposal_model,
-            messages=[self._SystemMessage(role="system", content=prompt), *self._typed_context(event)],
+            messages=[
+                self._SystemMessage(role="system", content=prompt),
+                *self._typed_context(event),
+            ],
             tools=self.tools,
             tool_choice="auto",
             temperature=0,
@@ -380,6 +394,47 @@ def _load_existing(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _merge_checkpoints(
+    existing: Iterable[dict[str, Any]], seeds: Iterable[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge restart checkpoints and previously validated compatible repairs."""
+    merged: dict[str, dict[str, Any]] = {}
+    for record in [*existing, *seeds]:
+        event_id = str(record.get("event_id", ""))
+        if not event_id:
+            raise ValueError("repair checkpoints require non-empty event IDs")
+        previous = merged.get(event_id)
+        if previous is not None and previous != record:
+            raise ValueError(f"conflicting repair checkpoints for event {event_id}")
+        merged[event_id] = record
+    return list(merged.values())
+
+
+def _interleave_events(
+    events: Iterable[FailureEvent], split_by_task: dict[str, str]
+) -> list[FailureEvent]:
+    """Prefer category/task diversity before taking a second event from one source."""
+    ordered: list[FailureEvent] = []
+    for split in ("validation", "train"):
+        groups: dict[str, dict[str, deque[FailureEvent]]] = defaultdict(lambda: defaultdict(deque))
+        for event in sorted(events, key=lambda item: item.event_id):
+            if split_by_task[event.task_id] == split:
+                groups[event.category][event.task_id].append(event)
+        task_cycles = {category: deque(sorted(by_task)) for category, by_task in groups.items()}
+        while groups:
+            for category in sorted(tuple(groups)):
+                task_id = task_cycles[category].popleft()
+                ordered.append(groups[category][task_id].popleft())
+                if groups[category][task_id]:
+                    task_cycles[category].append(task_id)
+                else:
+                    del groups[category][task_id]
+                if not groups[category]:
+                    del groups[category]
+                    del task_cycles[category]
+    return ordered
+
+
 def generate_validated_repairs(
     results: dict[str, Any],
     events: Iterable[FailureEvent],
@@ -388,6 +443,8 @@ def generate_validated_repairs(
     output: str | Path,
     report: str | Path,
     category: str,
+    categories: Iterable[str] | None = None,
+    output_category: str | None = None,
     train_task_ids: Iterable[str],
     validation_task_ids: Iterable[str],
     evaluation_task_ids: Iterable[str],
@@ -396,6 +453,7 @@ def generate_validated_repairs(
     minimum_per_split: int = 2,
     maximum_per_split: int = 0,
     overwrite: bool = False,
+    seed_repairs: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """Generate repairs, checkpointing only candidates that pass every validator."""
     output_path = Path(output).expanduser().resolve()
@@ -403,24 +461,36 @@ def generate_validated_repairs(
     train = {str(item) for item in train_task_ids}
     validation = {str(item) for item in validation_task_ids}
     evaluation = {str(item) for item in evaluation_task_ids}
-    split_by_task = {**{item: "train" for item in train}, **{item: "validation" for item in validation}}
+    split_by_task = {
+        **{item: "train" for item in train},
+        **{item: "validation" for item in validation},
+    }
     raw_simulations = {
         str(simulation.get("id", "")): simulation
         for simulation in results.get("simulations") or []
         if isinstance(simulation, dict)
     }
 
+    source_categories = tuple(
+        dict.fromkeys(str(item) for item in (categories or (category,)) if str(item))
+    )
+    if not source_categories:
+        raise ValueError("at least one source failure category is required")
+    target_category = str(output_category or category)
+    if not target_category:
+        raise ValueError("output failure category may not be empty")
+
     eligible = [
         event
         for event in events
-        if event.category == category
+        if event.category in source_categories
         and event.steerable
         and event.first_bad_message_index is not None
         and event.confidence >= minimum_confidence
         and event.task_id in split_by_task
         and event.task_id not in evaluation
     ]
-    eligible.sort(key=lambda event: (split_by_task[event.task_id] != "validation", event.event_id))
+    eligible = _interleave_events(eligible, split_by_task)
     counts_available = {
         split: sum(split_by_task[event.task_id] == split for event in eligible)
         for split in ("train", "validation")
@@ -428,10 +498,11 @@ def generate_validated_repairs(
     for split, count in counts_available.items():
         if count < minimum_per_split:
             raise ValueError(
-                f"only {count} eligible {split} events for {category}; need {minimum_per_split}"
+                f"only {count} eligible {split} events for {source_categories}; "
+                f"need {minimum_per_split}"
             )
 
-    accepted = [] if overwrite else _load_existing(output_path)
+    accepted = [] if overwrite else _merge_checkpoints(_load_existing(output_path), seed_repairs)
     eligible_ids = {event.event_id for event in eligible}
     unknown = {str(record["event_id"]) for record in accepted} - eligible_ids
     if unknown:
@@ -444,8 +515,19 @@ def generate_validated_repairs(
 
     audit: dict[str, Any] = {
         "schema_version": REPAIR_REPORT_SCHEMA,
-        "category": category,
+        "category": target_category,
+        "source_categories": list(source_categories),
         "available": counts_available,
+        "available_by_source_category": {
+            split: {
+                source: sum(
+                    split_by_task[event.task_id] == split and event.category == source
+                    for event in eligible
+                )
+                for source in source_categories
+            }
+            for split in ("train", "validation")
+        },
         "accepted": accepted_counts,
         "events": {},
     }
@@ -494,7 +576,8 @@ def generate_validated_repairs(
                     "simulation_id": event.simulation_id,
                     "task_id": event.task_id,
                     "split": split,
-                    "failure_category": event.category,
+                    "failure_category": target_category,
+                    "source_failure_category": event.category,
                     "source": "llm_proposal_tau2_replay_independent_llm_review",
                     "repaired_message": repaired,
                     "validation": {

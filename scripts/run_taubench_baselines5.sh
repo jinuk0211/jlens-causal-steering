@@ -9,9 +9,12 @@ TAU2_ROOT="${TAU2_ROOT:-/workspace/tau2-bench}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/workspace/jlens-artifacts/taubench-airline/tool-call-error}"
 PREFIX="${PREFIX:-failure-steering-baselines5-v1}"
 BASELINE_PREFIX="${BASELINE_PREFIX:-failure-steering}"
-FAILURE_CATEGORY="tool_call_error"
-MINIMUM_TRAIN_EVENTS=2
-MINIMUM_VALIDATION_EVENTS=1
+FAILURE_CATEGORY="${FAILURE_CATEGORY:-tool_call_error}"
+FAILURE_SOURCE_CATEGORIES="${FAILURE_SOURCE_CATEGORIES:-$FAILURE_CATEGORY}"
+read -r -a FAILURE_SOURCE_CATEGORY_ARGS <<<"$FAILURE_SOURCE_CATEGORIES"
+MINIMUM_TRAIN_EVENTS="${MINIMUM_TRAIN_EVENTS:-2}"
+MINIMUM_VALIDATION_EVENTS="${MINIMUM_VALIDATION_EVENTS:-1}"
+REPAIR_MINIMUM_PER_SPLIT="${REPAIR_MINIMUM_PER_SPLIT:-$MINIMUM_VALIDATION_EVENTS}"
 REVIEW_MODEL="${REVIEW_MODEL:-gpt-4.1-2025-04-14}"
 USER_MODEL="${USER_MODEL:-gpt-5.2-2025-12-11}"
 PROPOSAL_MODEL="${PROPOSAL_MODEL:-gpt-5.2}"
@@ -21,15 +24,16 @@ REVIEW_ATTEMPTS="${REVIEW_ATTEMPTS:-3}"
 REVIEW_RETRY_DELAY_SECONDS="${REVIEW_RETRY_DELAY_SECONDS:-65}"
 SIMULATION_TIMEOUT_SECONDS="${SIMULATION_TIMEOUT_SECONDS:-1200}"
 
-MANIFEST="${CAUSAL_ROOT}/configs/taubench_airline_failure_modes_qwen35_4b.json"
+MANIFEST="${MANIFEST:-${CAUSAL_ROOT}/configs/taubench_airline_failure_modes_qwen35_4b.json}"
 TOOLS_JSON="${CAUSAL_ROOT}/configs/taubench_airline_tools.json"
-MATRIX="${CAUSAL_ROOT}/outputs/taubench-airline-failure-matrix.json"
+MATRIX="${MATRIX:-${CAUSAL_ROOT}/outputs/taubench-airline-failure-matrix.json}"
 MERGED="${CAUSAL_ROOT}/outputs/taubench-airline-merged-reviewed.json"
 AUDIT_DIR="${CAUSAL_ROOT}/outputs/taubench-airline-failure-audit"
 EVENTS="${AUDIT_DIR}/failure-events.jsonl"
-REPAIRS="${CAUSAL_ROOT}/outputs/taubench-airline-repairs.jsonl"
-REPAIR_REPORT="${CAUSAL_ROOT}/outputs/taubench-airline-repairs.report.json"
-REPAIR_PAIRS="${CAUSAL_ROOT}/outputs/taubench-airline-repair-pairs.jsonl"
+REPAIRS="${REPAIRS:-${CAUSAL_ROOT}/outputs/taubench-airline-repairs.jsonl}"
+REPAIR_REPORT="${REPAIR_REPORT:-${CAUSAL_ROOT}/outputs/taubench-airline-repairs.report.json}"
+REPAIR_PAIRS="${REPAIR_PAIRS:-${CAUSAL_ROOT}/outputs/taubench-airline-repair-pairs.jsonl}"
+REPAIR_SEED="${REPAIR_SEED:-}"
 RESULTS_ROOT="data/simulations/${PREFIX}"
 TELEMETRY_ROOT="data/jlens-telemetry/${PREFIX}"
 ANALYSIS_ROOT="data/analysis/${PREFIX}"
@@ -99,15 +103,15 @@ python -m jlens_causal.failure_cli audit \
 python - \
   "$EVENTS" \
   "$MANIFEST" \
-  "$FAILURE_CATEGORY" \
   "$MINIMUM_TRAIN_EVENTS" \
-  "$MINIMUM_VALIDATION_EVENTS" <<'PY' \
+  "$MINIMUM_VALIDATION_EVENTS" \
+  "${FAILURE_SOURCE_CATEGORY_ARGS[@]}" <<'PY' \
   2>&1 | tee -a "$RUN_LOG"
 import json
 import sys
 from collections import Counter
 
-events_path, manifest_path, category, minimum_train, minimum_validation = sys.argv[1:]
+events_path, manifest_path, minimum_train, minimum_validation, *categories = sys.argv[1:]
 minimum_train = int(minimum_train)
 minimum_validation = int(minimum_validation)
 manifest = json.load(open(manifest_path, encoding="utf-8"))
@@ -124,12 +128,12 @@ with open(events_path, encoding="utf-8") as handle:
         split = split_by_task.get(str(event.get("task_id")))
         if split and event.get("steerable") and event.get("first_bad_message_index") is not None:
             inventory[(str(event.get("category")), split)] += 1
-            if event.get("category") == category and float(event.get("confidence", 0.0)) >= 0.5:
+            if event.get("category") in categories and float(event.get("confidence", 0.0)) >= 0.5:
                 counts[split] += 1
 print("eligible structural/review event inventory:")
 for (name, split), count in sorted(inventory.items()):
     print(f"  {name:36s} {split:10s} {count}")
-print(f"selected category {category!r}: train={counts['train']} validation={counts['validation']}")
+print(f"pooled source categories {categories!r}: train={counts['train']} validation={counts['validation']}")
 if counts["train"] < minimum_train or counts["validation"] < minimum_validation:
     raise SystemExit(
         f"Need at least {minimum_train} eligible train event(s) and "
@@ -140,18 +144,25 @@ if counts["train"] < minimum_train or counts["validation"] < minimum_validation:
 PY
 
 echo "===== Generate and validate counterfactual repairs =====" | tee -a "$RUN_LOG"
+REPAIR_SEED_ARGS=()
+if [[ -n "$REPAIR_SEED" && -s "$REPAIR_SEED" ]]; then
+  REPAIR_SEED_ARGS=(--seed-repairs "$REPAIR_SEED")
+fi
 python -u -m jlens_causal.failure_cli repairs \
   "$MERGED" \
   "$EVENTS" \
   "$MANIFEST" \
   --category "$FAILURE_CATEGORY" \
+  --categories "${FAILURE_SOURCE_CATEGORY_ARGS[@]}" \
+  --output-category "$FAILURE_CATEGORY" \
+  "${REPAIR_SEED_ARGS[@]}" \
   --output "$REPAIRS" \
   --report "$REPAIR_REPORT" \
   --pairs-output "$REPAIR_PAIRS" \
   --proposal-model "$PROPOSAL_MODEL" \
   --review-model "$REVIEW_MODEL" \
   --reasoning-effort low \
-  --minimum-per-split "$MINIMUM_VALIDATION_EVENTS" \
+  --minimum-per-split "$REPAIR_MINIMUM_PER_SPLIT" \
   --maximum-per-split "$REPAIR_MAX_PER_SPLIT" \
   --max-attempts "$REPAIR_MAX_ATTEMPTS" \
   --review-tpm 27000 \
@@ -392,21 +403,21 @@ run_and_review() {
 }
 
 VALIDATION_CONDITIONS=(
-  tool_call_error-caa-s0.5
-  tool_call_error-caa-s1
-  tool_call_error-caa-s2
-  tool_call_error-mera-s0.5
-  tool_call_error-mera-s1
-  tool_call_error-mera-s2
-  tool_call_error-sadi-s5
-  tool_call_error-sadi-s10
-  tool_call_error-sadi-s20
-  tool_call_error-iti-s5
-  tool_call_error-iti-s10
-  tool_call_error-iti-s15
-  tool_call_error-austeer-s5
-  tool_call_error-austeer-s10
-  tool_call_error-austeer-s15
+  "${FAILURE_CATEGORY}-caa-s0.5"
+  "${FAILURE_CATEGORY}-caa-s1"
+  "${FAILURE_CATEGORY}-caa-s2"
+  "${FAILURE_CATEGORY}-mera-s0.5"
+  "${FAILURE_CATEGORY}-mera-s1"
+  "${FAILURE_CATEGORY}-mera-s2"
+  "${FAILURE_CATEGORY}-sadi-s5"
+  "${FAILURE_CATEGORY}-sadi-s10"
+  "${FAILURE_CATEGORY}-sadi-s20"
+  "${FAILURE_CATEGORY}-iti-s5"
+  "${FAILURE_CATEGORY}-iti-s10"
+  "${FAILURE_CATEGORY}-iti-s15"
+  "${FAILURE_CATEGORY}-austeer-s5"
+  "${FAILURE_CATEGORY}-austeer-s10"
+  "${FAILURE_CATEGORY}-austeer-s15"
 )
 
 for condition in "${VALIDATION_CONDITIONS[@]}"; do

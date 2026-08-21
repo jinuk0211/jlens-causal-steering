@@ -69,6 +69,22 @@ def test_pair_builder_excludes_future_messages_and_assigns_train_split():
     assert pair["positive_repaired_message"]["tool_calls"][0]["arguments"] == {"id": "x"}
 
 
+def test_pair_builder_can_pool_source_failures_under_one_output_category():
+    results, event, repair = _fixture()
+    pairs = build_failure_response_pairs(
+        results,
+        [event],
+        [repair],
+        train_task_ids=["1"],
+        validation_task_ids=["2"],
+        evaluation_task_ids=["3"],
+        failure_category="agent_behavior_error",
+    )
+
+    assert pairs[0]["failure_category"] == "agent_behavior_error"
+    assert pairs[0]["source_failure_category"] == "tool_call_error"
+
+
 def test_pair_builder_rejects_evaluation_leakage_and_unvalidated_repairs():
     results, event, repair = _fixture(task_id="3")
     with pytest.raises(ValueError, match="may not supply repair pairs"):

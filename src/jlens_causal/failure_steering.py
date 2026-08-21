@@ -24,13 +24,21 @@ JSERVO_CONTROLS = {
 }
 
 STEERING_OPPORTUNITY_BOUNDARIES = {
-    "tool_call_error": "after_tool_error",
+    "tool_call_error": ("after_tool_error",),
     # These boundaries precede the action we want to change.  Waiting for an
     # exact repeat to be observed would make the intervention post-hoc.
-    "retry_without_state_change": "after_tool_error",
-    "repeated_tool_call": "after_successful_tool_result",
-    "short_tool_cycle": "after_short_tool_cycle",
-    "completion_not_released": "after_successful_tool_result",
+    "retry_without_state_change": ("after_tool_error",),
+    "repeated_tool_call": ("after_successful_tool_result",),
+    "short_tool_cycle": ("after_short_tool_cycle",),
+    "completion_not_released": ("after_successful_tool_result",),
+    # Review-localized semantic failures can occur at any agent decision.  The
+    # intervention is therefore prospective and prefix-visible: it is active
+    # before the first action, after a user turn, and after any tool result.
+    "agent_behavior_error": (
+        "initial_decision",
+        "after_user_message",
+        "after_tool_result",
+    ),
 }
 # Compatibility alias for code that imported the original public name.
 STRUCTURAL_BOUNDARIES = STEERING_OPPORTUNITY_BOUNDARIES
@@ -143,9 +151,16 @@ def load_failure_steering_manifest(path: str | Path) -> FailureSteeringManifest:
             raise ValueError(f"unsupported online structural failure category {category!r}")
         if not isinstance(mode, dict):
             raise ValueError(f"failure_modes.{category} must be an object")
-        boundary = mode.get("boundary", STRUCTURAL_BOUNDARIES[category])
-        if boundary != STRUCTURAL_BOUNDARIES[category]:
-            raise ValueError(f"{category} must use boundary {STRUCTURAL_BOUNDARIES[category]!r}")
+        expected_boundaries = STRUCTURAL_BOUNDARIES[category]
+        declared_boundaries = mode.get("boundaries")
+        if declared_boundaries is None:
+            declared_boundaries = mode.get("boundary", expected_boundaries)
+        if isinstance(declared_boundaries, str):
+            declared_boundaries = (declared_boundaries,)
+        elif isinstance(declared_boundaries, list):
+            declared_boundaries = tuple(str(item) for item in declared_boundaries)
+        if declared_boundaries != expected_boundaries:
+            raise ValueError(f"{category} must use boundaries {expected_boundaries!r}")
         methods = mode.get("methods")
         if not isinstance(methods, dict) or not methods:
             raise ValueError(f"failure_modes.{category}.methods is required")
@@ -176,15 +191,16 @@ def load_failure_steering_manifest(path: str | Path) -> FailureSteeringManifest:
         raise ValueError(f"manifest must cover every configured method; missing {sorted(missing)}")
     adaptive = raw.get("adaptive_controller")
     if adaptive is not None:
-        if not isinstance(adaptive, dict) or not isinstance(
-            adaptive.get("artifact_path"), str
-        ):
+        if not isinstance(adaptive, dict) or not isinstance(adaptive.get("artifact_path"), str):
             raise ValueError("adaptive_controller.artifact_path is required")
         conditions = adaptive.get("conditions")
         if not isinstance(conditions, list) or not conditions:
             raise ValueError("adaptive_controller.conditions must be non-empty")
         for condition in conditions:
-            if not isinstance(condition, dict) or condition.get("control_type") not in JSERVO_CONTROLS:
+            if (
+                not isinstance(condition, dict)
+                or condition.get("control_type") not in JSERVO_CONTROLS
+            ):
                 raise ValueError("adaptive_controller has an unknown control_type")
             if condition.get("control_type") == "fixed_strength" and not isinstance(
                 condition.get("fixed_strength"), (int, float)
@@ -224,9 +240,7 @@ def _condition(
         "hf_sdpa_backend": model.get("attention", "auto"),
         "hf_trust_remote_code": bool(model.get("trust_remote_code", False)),
         "jlens_require_remote": True,
-        "jlens_mode": (
-            "observe" if intervention is None and controller is None else "intervene"
-        ),
+        "jlens_mode": ("observe" if intervention is None and controller is None else "intervene"),
     }
     if intervention is not None:
         args["jlens_intervention"] = intervention
@@ -257,18 +271,22 @@ def compile_failure_steering_matrix(
     ]
     categories = list(manifest.raw["failure_modes"])
     for category, mode in manifest.raw["failure_modes"].items():
-        boundary = STRUCTURAL_BOUNDARIES[category]
+        boundaries = STRUCTURAL_BOUNDARIES[category]
         wrong_category = next((item for item in categories if item != category), None)
-        wrong_boundary = (
+        wrong_boundaries = (
             STRUCTURAL_BOUNDARIES[wrong_category]
             if wrong_category is not None
-            else "after_successful_tool_result"
+            else ("after_successful_tool_result",)
         )
         for method, specification in mode["methods"].items():
             template = deepcopy(specification["intervention"])
             for strength_value in specification["strengths"]:
                 strength = float(strength_value)
-                positive = {**deepcopy(template), "strength": strength, "boundaries": [boundary]}
+                positive = {
+                    **deepcopy(template),
+                    "strength": strength,
+                    "boundaries": list(boundaries),
+                }
                 stem = f"{category}-{method}-s{strength:g}"
                 conditions.append(
                     _condition(
@@ -289,7 +307,7 @@ def compile_failure_steering_matrix(
                 negative = {
                     **deepcopy(template),
                     "strength": negative_strength,
-                    "boundaries": [boundary],
+                    "boundaries": list(boundaries),
                 }
                 negative_control_type = (
                     "zero_dose" if negative_strength == 0.0 else "negative_direction"
@@ -308,7 +326,7 @@ def compile_failure_steering_matrix(
                 wrong = {
                     **deepcopy(template),
                     "strength": strength,
-                    "boundaries": [wrong_boundary],
+                    "boundaries": list(wrong_boundaries),
                 }
                 conditions.append(
                     _condition(
@@ -325,7 +343,7 @@ def compile_failure_steering_matrix(
                         **deepcopy(template),
                         "layer": int(specification["wrong_layer"]),
                         "strength": strength,
-                        "boundaries": [boundary],
+                        "boundaries": list(boundaries),
                     }
                     conditions.append(
                         _condition(
