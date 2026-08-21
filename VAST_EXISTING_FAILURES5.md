@@ -17,8 +17,12 @@ The pooled `agent_behavior_error` dataset uses localized, steerable events from:
 `task_failure_unlocalized` is excluded because it has no causal assistant message
 index. Previously validated `tool_call_error` repairs are reused as seeds. The
 runner fills a diverse quota of four train and four validation repairs, extracts
-CAA, MERA, SADI, ITI, and AUSteer artifacts, runs three validation strengths for
-each method, selects one strength per method, and runs the frozen evaluation set.
+CAA, MERA, SADI, ITI, and AUSteer artifacts, and runs the frozen evaluation set
+with one fixed midpoint strength per method: CAA/MERA `1.0` and
+SADI/ITI/AUSteer `10.0`. The trajectory-level validation strength sweep is
+skipped, reducing the default from 190 to 100 steered simulations. Set
+`FIXED_STRENGTH_EVALUATION_ONLY=0` to restore the three-strength validation
+selection protocol.
 
 ## Vast command
 

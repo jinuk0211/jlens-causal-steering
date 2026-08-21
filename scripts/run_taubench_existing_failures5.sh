@@ -22,5 +22,6 @@ export REPAIR_MINIMUM_PER_SPLIT="${REPAIR_MINIMUM_PER_SPLIT:-4}"
 export REPAIR_MAX_PER_SPLIT="${REPAIR_MAX_PER_SPLIT:-4}"
 export RUN_LOG="${RUN_LOG:-/workspace/taubench-behavior5.log}"
 export WORKER_LOG="${WORKER_LOG:-/workspace/jlens-remote-worker-behavior5.log}"
+export FIXED_STRENGTH_EVALUATION_ONLY="${FIXED_STRENGTH_EVALUATION_ONLY:-1}"
 
 exec bash "${CAUSAL_ROOT}/scripts/run_taubench_baselines5.sh"

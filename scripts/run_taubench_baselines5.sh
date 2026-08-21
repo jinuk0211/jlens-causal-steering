@@ -27,6 +27,7 @@ REPAIR_MAX_PER_SPLIT="${REPAIR_MAX_PER_SPLIT:-8}"
 REVIEW_ATTEMPTS="${REVIEW_ATTEMPTS:-3}"
 REVIEW_RETRY_DELAY_SECONDS="${REVIEW_RETRY_DELAY_SECONDS:-65}"
 SIMULATION_TIMEOUT_SECONDS="${SIMULATION_TIMEOUT_SECONDS:-1200}"
+FIXED_STRENGTH_EVALUATION_ONLY="${FIXED_STRENGTH_EVALUATION_ONLY:-0}"
 
 MANIFEST="${MANIFEST:-${CAUSAL_ROOT}/configs/taubench_airline_failure_modes_qwen35_4b.json}"
 TOOLS_JSON="${CAUSAL_ROOT}/configs/taubench_airline_tools.json"
@@ -407,38 +408,49 @@ run_and_review() {
   die "invalid or incomplete review after ${REVIEW_ATTEMPTS} attempts: $reviewed"
 }
 
-VALIDATION_CONDITIONS=(
-  "${FAILURE_CATEGORY}-caa-s0.5"
-  "${FAILURE_CATEGORY}-caa-s1"
-  "${FAILURE_CATEGORY}-caa-s2"
-  "${FAILURE_CATEGORY}-mera-s0.5"
-  "${FAILURE_CATEGORY}-mera-s1"
-  "${FAILURE_CATEGORY}-mera-s2"
-  "${FAILURE_CATEGORY}-sadi-s5"
-  "${FAILURE_CATEGORY}-sadi-s10"
-  "${FAILURE_CATEGORY}-sadi-s20"
-  "${FAILURE_CATEGORY}-iti-s5"
-  "${FAILURE_CATEGORY}-iti-s10"
-  "${FAILURE_CATEGORY}-iti-s15"
-  "${FAILURE_CATEGORY}-austeer-s5"
-  "${FAILURE_CATEGORY}-austeer-s10"
-  "${FAILURE_CATEGORY}-austeer-s15"
-)
+if [[ "$FIXED_STRENGTH_EVALUATION_ONLY" == 1 ]]; then
+  echo "===== Skip validation sweep; use one fixed strength per method =====" \
+    | tee -a "$RUN_LOG"
+  EVALUATION_CONDITIONS=(
+    "${FAILURE_CATEGORY}-caa-s1"
+    "${FAILURE_CATEGORY}-mera-s1"
+    "${FAILURE_CATEGORY}-sadi-s10"
+    "${FAILURE_CATEGORY}-iti-s10"
+    "${FAILURE_CATEGORY}-austeer-s10"
+  )
+else
+  VALIDATION_CONDITIONS=(
+    "${FAILURE_CATEGORY}-caa-s0.5"
+    "${FAILURE_CATEGORY}-caa-s1"
+    "${FAILURE_CATEGORY}-caa-s2"
+    "${FAILURE_CATEGORY}-mera-s0.5"
+    "${FAILURE_CATEGORY}-mera-s1"
+    "${FAILURE_CATEGORY}-mera-s2"
+    "${FAILURE_CATEGORY}-sadi-s5"
+    "${FAILURE_CATEGORY}-sadi-s10"
+    "${FAILURE_CATEGORY}-sadi-s20"
+    "${FAILURE_CATEGORY}-iti-s5"
+    "${FAILURE_CATEGORY}-iti-s10"
+    "${FAILURE_CATEGORY}-iti-s15"
+    "${FAILURE_CATEGORY}-austeer-s5"
+    "${FAILURE_CATEGORY}-austeer-s10"
+    "${FAILURE_CATEGORY}-austeer-s15"
+  )
 
-for condition in "${VALIDATION_CONDITIONS[@]}"; do
-  run_and_review validation "$condition"
-done
+  for condition in "${VALIDATION_CONDITIONS[@]}"; do
+    run_and_review validation "$condition"
+  done
 
-python scripts/analyze_airline_failure_steering.py \
-  "$MATRIX" \
-  --split validation \
-  --results-root "$RESULTS_ROOT" \
-  --telemetry-root "$TELEMETRY_ROOT" \
-  --output-dir "$ANALYSIS_ROOT" \
-  2>&1 | tee -a "$RUN_LOG"
+  python scripts/analyze_airline_failure_steering.py \
+    "$MATRIX" \
+    --split validation \
+    --results-root "$RESULTS_ROOT" \
+    --telemetry-root "$TELEMETRY_ROOT" \
+    --output-dir "$ANALYSIS_ROOT" \
+    2>&1 | tee -a "$RUN_LOG"
 
-mapfile -t EVALUATION_CONDITIONS < <(
-  python - "$ANALYSIS_ROOT/validation.json" <<'PY'
+  mapfile -t EVALUATION_CONDITIONS < <(
+    python - "$ANALYSIS_ROOT/validation.json" <<'PY'
 import json
 import math
 import sys
@@ -472,7 +484,8 @@ for method in methods:
     )
     print(best["condition"])
 PY
-)
+  )
+fi
 
 [[ "${#EVALUATION_CONDITIONS[@]}" -eq 5 ]] \
   || die "expected five selected evaluation conditions"
@@ -493,9 +506,15 @@ python scripts/analyze_airline_failure_steering.py \
   2>&1 | tee -a "$RUN_LOG"
 
 echo "Five-baseline run complete" | tee -a "$RUN_LOG"
-echo "Validation: 15 conditions x 6 tasks = 90" | tee -a "$RUN_LOG"
-echo "Evaluation: 5 selected conditions x 20 tasks = 100" | tee -a "$RUN_LOG"
-echo "Total steered: 190 trajectories" | tee -a "$RUN_LOG"
+if [[ "$FIXED_STRENGTH_EVALUATION_ONLY" == 1 ]]; then
+  echo "Validation strength sweep: skipped (fixed strengths)" | tee -a "$RUN_LOG"
+  echo "Evaluation: 5 fixed conditions x 20 tasks = 100" | tee -a "$RUN_LOG"
+  echo "Total steered in this protocol: 100 trajectories" | tee -a "$RUN_LOG"
+else
+  echo "Validation: 15 conditions x 6 tasks = 90" | tee -a "$RUN_LOG"
+  echo "Evaluation: 5 selected conditions x 20 tasks = 100" | tee -a "$RUN_LOG"
+  echo "Total steered: 190 trajectories" | tee -a "$RUN_LOG"
+fi
 echo "Selected conditions: /workspace/baselines5-selected-conditions.txt" | tee -a "$RUN_LOG"
 echo "Analysis: ${TAU2_ROOT}/${ANALYSIS_ROOT}" | tee -a "$RUN_LOG"
 echo "Log: ${RUN_LOG}" | tee -a "$RUN_LOG"
