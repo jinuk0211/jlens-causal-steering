@@ -57,9 +57,14 @@ def select_failure_pairs(
     return train, validation
 
 
-def _modules(runtime: ModelRuntime, site: str) -> list[Any]:
-    modules = []
-    for index, block in enumerate(runtime.lens_model.layers):
+def _modules(
+    runtime: ModelRuntime, site: str, layers: Iterable[int]
+) -> dict[int, Any]:
+    modules = {}
+    for index in sorted(set(int(layer) for layer in layers)):
+        if index < 0 or index >= len(runtime.lens_model.layers):
+            raise ValueError(f"model layer {index} is outside the model")
+        block = runtime.lens_model.layers[index]
         if site == "post_attention_layernorm":
             module = getattr(block, "post_attention_layernorm", None)
         elif site == "mlp_output":
@@ -70,7 +75,7 @@ def _modules(runtime: ModelRuntime, site: str) -> list[Any]:
             raise ValueError(f"unknown extraction site {site}")
         if module is None:
             raise ValueError(f"model layer {index} lacks site {site}")
-        modules.append(module)
+        modules[index] = module
     return modules
 
 
@@ -101,7 +106,7 @@ def _capture(
     site: str,
     reshape: Callable[[Any], Any] | None = None,
 ) -> dict[int, Any]:
-    modules = _modules(runtime, site)
+    modules = _modules(runtime, site, layers)
     context = (
         _capture_inputs(modules, layers)
         if site == "attention_o_proj_input"
@@ -290,6 +295,9 @@ def _attention_shape(runtime: ModelRuntime) -> tuple[int, int]:
     config = runtime.hf_model.config
     text_config = getattr(config, "text_config", config)
     heads = int(text_config.num_attention_heads)
+    configured_head_dim = getattr(text_config, "head_dim", None)
+    if configured_head_dim is not None:
+        return heads, int(configured_head_dim)
     width = int(runtime.lens_model.d_model)
     if width % heads:
         raise ValueError("model width is not divisible by attention heads")

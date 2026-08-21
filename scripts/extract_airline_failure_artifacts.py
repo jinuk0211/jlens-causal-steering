@@ -59,6 +59,12 @@ def main() -> int:
         help="J-Servo failure categories; defaults to --category",
     )
     parser.add_argument("--layers", nargs="+", type=int, default=[20, 24])
+    parser.add_argument(
+        "--attention-layers",
+        nargs="+",
+        type=int,
+        help="full-attention layers for ITI/AUSteer; defaults to --layers",
+    )
     parser.add_argument("--condition-layers", nargs="+", type=int, default=[16, 20, 24])
     parser.add_argument("--observation-layers", nargs="+", type=int, default=[16])
     parser.add_argument("--condition-pairs", type=Path)
@@ -93,6 +99,10 @@ def main() -> int:
         "layers": args.layers,
         "output_dir": args.output_dir,
         "tools": tools,
+    }
+    attention_common = {
+        **common,
+        "layers": args.attention_layers or args.layers,
     }
     methods = list(manifest.enabled_methods) if args.method == "all" else [args.method]
     disabled = set(methods) - set(manifest.enabled_methods)
@@ -148,11 +158,11 @@ def main() -> int:
             )
         elif method == "iti":
             result = extract_failure_iti(
-                **common, top_k=args.top_k or 8, force=args.force
+                **attention_common, top_k=args.top_k or 8, force=args.force
             )
         elif method == "austeer":
             result = extract_failure_austeer(
-                **common, top_k=args.top_k or 100, force=args.force
+                **attention_common, top_k=args.top_k or 100, force=args.force
             )
         else:
             raise AssertionError(f"unhandled artifact method {method}")

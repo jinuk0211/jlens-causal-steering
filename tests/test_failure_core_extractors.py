@@ -1,6 +1,12 @@
+from types import SimpleNamespace
+
 import pytest
 
-from jlens_causal.failure_core_extractors import select_failure_pairs
+from jlens_causal.failure_core_extractors import (
+    _attention_shape,
+    _modules,
+    select_failure_pairs,
+)
 
 
 def _pair(pair_id, split, category="retry_without_state_change"):
@@ -38,3 +44,32 @@ def test_select_failure_pairs_rejects_missing_validation_and_duplicate_ids():
             ],
             "retry_without_state_change",
         )
+
+
+def test_attention_modules_only_require_requested_full_attention_layers():
+    projection = object()
+    runtime = SimpleNamespace(
+        lens_model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(linear_attn=object()),
+                SimpleNamespace(self_attn=SimpleNamespace(o_proj=projection)),
+            ]
+        )
+    )
+
+    assert _modules(runtime, "attention_o_proj_input", [1]) == {1: projection}
+    with pytest.raises(ValueError, match="layer 0 lacks site"):
+        _modules(runtime, "attention_o_proj_input", [0])
+
+
+def test_attention_shape_prefers_explicit_head_dimension_for_wide_qwen_heads():
+    runtime = SimpleNamespace(
+        hf_model=SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(num_attention_heads=16, head_dim=256)
+            )
+        ),
+        lens_model=SimpleNamespace(d_model=2560),
+    )
+
+    assert _attention_shape(runtime) == (16, 256)

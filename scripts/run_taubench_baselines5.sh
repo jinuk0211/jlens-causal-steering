@@ -244,6 +244,7 @@ else
     "$REPAIR_PAIRS" \
     --category "$FAILURE_CATEGORY" \
     --layers 20 24 \
+    --attention-layers 19 23 \
     --tools-json "$TOOLS_JSON" \
     --output-dir "$ARTIFACT_ROOT" \
     2>&1 | tee -a "$RUN_LOG"
