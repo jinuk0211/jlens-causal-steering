@@ -22,6 +22,28 @@ each method, selects one strength per method, and runs the frozen evaluation set
 
 ## Vast command
 
+On a completely new instance, install both repositories and their shared
+environment first:
+
+```bash
+cd /workspace
+curl -fsSL https://raw.githubusercontent.com/jinuk0211/jlens-causal-steering/agent/jlens-thought-steering/scripts/setup_taubench_existing_failures5_fresh_vast.sh | bash
+```
+
+Git contains code only. Restore these six files from the Drive snapshot before
+starting the run:
+
+```text
+/workspace/tau2-bench/data/simulations/failure-steering/train/baseline/results.json
+/workspace/tau2-bench/data/simulations/failure-steering/train/baseline/results_reviewed.json
+/workspace/tau2-bench/data/simulations/failure-steering/validation/baseline/results.json
+/workspace/tau2-bench/data/simulations/failure-steering/validation/baseline/results_reviewed.json
+/workspace/tau2-bench/data/simulations/failure-steering/evaluation/baseline/results.json
+/workspace/tau2-bench/data/simulations/failure-steering/evaluation/baseline/results_reviewed.json
+```
+
+If the repositories and data are already present, use the shorter update path:
+
 ```bash
 cd /workspace/jlens-causal-steering
 git pull --ff-only origin agent/jlens-thought-steering
