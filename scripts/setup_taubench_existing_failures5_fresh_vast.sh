@@ -8,6 +8,8 @@ VAST_ROOT="${VAST_ROOT:-/workspace}"
 CAUSAL_REF="${CAUSAL_REF:-agent/jlens-thought-steering}"
 TAU2_REF="${TAU2_REF:-codex/jlens-telecom-backend}"
 RUN_STEERING="${RUN_STEERING:-0}"
+PYTORCH_VERSION="${PYTORCH_VERSION:-2.8.0}"
+PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 CAUSAL_DIR="${VAST_ROOT}/jlens-causal-steering"
 TAU2_DIR="${VAST_ROOT}/tau2-bench"
 
@@ -58,6 +60,12 @@ fi
 source .venv/bin/activate
 
 python -m pip install --upgrade pip wheel "setuptools>=77,<81"
+# PyPI currently resolves the open-ended torch dependency to a CUDA 13 wheel.
+# Vast images whose driver advertises CUDA 12.8 cannot initialize that wheel,
+# so install a known-compatible build before resolving the editable projects.
+python -m pip install --upgrade --no-cache-dir \
+  --index-url "$PYTORCH_INDEX_URL" \
+  "torch==${PYTORCH_VERSION}"
 python -m pip install -e "$CAUSAL_DIR"
 python -m pip install -e "$TAU2_DIR" jsonschema
 
