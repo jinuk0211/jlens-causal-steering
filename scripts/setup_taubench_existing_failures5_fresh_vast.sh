@@ -66,6 +66,12 @@ python -m pip install --upgrade pip wheel "setuptools>=77,<81"
 python -m pip install --upgrade --no-cache-dir \
   --index-url "$PYTORCH_INDEX_URL" \
   "torch==${PYTORCH_VERSION}"
+# Vast images expose their base environment through --system-site-packages.
+# Some images contain only the cusparseLt package metadata there, so pip treats
+# it as satisfied even though libcusparseLt.so.0 is absent.  Put the wheel in
+# this venv explicitly before importing torch.
+python -m pip install --upgrade --force-reinstall --no-deps --no-cache-dir \
+  "nvidia-cusparselt-cu12==0.7.1"
 python -m pip install -e "$CAUSAL_DIR"
 python -m pip install -e "$TAU2_DIR" jsonschema
 
