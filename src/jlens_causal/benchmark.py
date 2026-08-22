@@ -206,9 +206,7 @@ def build_tool_calling_system_prompt(base_prompt: str, tools: tuple[ToolSpec, ..
         parameter_lines = []
         for name, type_name, required, description in parameters:
             requirement = "[required]" if required else "[optional]"
-            parameter_lines.append(
-                f"  - {name} ({type_name}) {requirement}: {description}"
-            )
+            parameter_lines.append(f"  - {name} ({type_name}) {requirement}: {description}")
         descriptions.append(
             f"**{tool.name}**\n{tool.description}\nParameters:\n"
             + ("\n".join(parameter_lines) if parameter_lines else "  (none)")

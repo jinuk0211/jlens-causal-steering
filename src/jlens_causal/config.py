@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "jlens-causal-pilot-v1"
+SCHEMA_VERSION = "jlens-causal-pilot-v3"
 VALID_METHODS = frozenset({"jlens", "contrastive", "random"})
 VALID_DIRECTIONS = frozenset({"a_to_b", "b_to_a"})
-VALID_POSITIONS = frozenset({"all", "last", "prompt_all", "prompt_first", "prompt_last", "decode"})
+VALID_POSITIONS = frozenset({"user_span", "system_matched", "prompt_first", "prompt_last"})
 
 
 def _require(mapping: dict[str, Any], key: str, expected: type) -> Any:
@@ -62,12 +62,18 @@ class PilotConfig:
         return self.output_dir / "directions.pt"
 
     @property
+    def target_selection_path(self) -> Path:
+        return self.output_dir / "target_selection.json"
+
+    @property
     def records_path(self) -> Path:
         return self.output_dir / "runs.jsonl"
 
     @property
     def direction_fingerprint(self) -> str:
         payload = {
+            "config_schema_version": SCHEMA_VERSION,
+            "direction_algorithm": "lexically-anchored-cross-domain-thought-axis-v2",
             "model": self.model,
             "calibration": {
                 key: self.data[key]
@@ -81,6 +87,7 @@ class PilotConfig:
             },
             "directions": self.directions,
             "layers": self.sweep["layers"],
+            "coordinate_swap_layers": self.sweep["coordinate_swap_layers"],
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
@@ -89,6 +96,8 @@ class PilotConfig:
     def run_fingerprint(self) -> str:
         """Hash every semantic input that can change a generation result."""
         payload = {
+            "config_schema_version": SCHEMA_VERSION,
+            "record_semantics": "thought-steering-v3",
             "direction_fingerprint": self.direction_fingerprint,
             "model": self.model,
             "evaluation": {
@@ -139,7 +148,7 @@ class PilotConfig:
         }
         if self.sweep["include_paper_coordinate_swap"]:
             counts["paper_swap"] = (
-                pairs * directions * layers * len(self.sweep["coordinate_swap_alphas"]) * 3
+                pairs * directions * len(self.sweep["coordinate_swap_alphas"]) * 3
             )
         counts["total"] = sum(counts.values())
         return counts
@@ -188,18 +197,36 @@ def load_config(value: str | Path) -> PilotConfig:
     if overlap:
         raise ValueError(f"calibration/evaluation domains overlap: {sorted(overlap)}")
 
-    for key in ("concept_a_aliases", "concept_b_aliases", "random_seeds"):
-        values = _require(directions, key, list)
-        if not values:
-            raise ValueError(f"{key} cannot be empty")
-        if len(values) != len(set(values)):
-            raise ValueError(f"{key} must contain unique values")
+    values = _require(directions, "random_seeds", list)
+    if not values:
+        raise ValueError("random_seeds cannot be empty")
+    if len(values) != len(set(values)):
+        raise ValueError("random_seeds must contain unique values")
     if any(not isinstance(seed, int) for seed in directions["random_seeds"]):
         raise ValueError("random_seeds must contain integers")
-    if directions.get("match_norm_to") != "contrastive":
-        raise ValueError("v1 requires match_norm_to='contrastive'")
+    if directions.get("scale") != "mean_residual_norm":
+        raise ValueError("directions.scale must be 'mean_residual_norm'")
+    target_selection = _require(directions, "target_selection", dict)
+    for key in (
+        "top_k",
+        "min_domain_consistency",
+        "candidate_per_fold",
+        "min_loo_frequency",
+        "min_lexical_domains",
+        "readout_layer",
+    ):
+        value = target_selection.get(key)
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"directions.target_selection.{key} must be a positive integer")
+    if target_selection["min_domain_consistency"] > len(data["calibration_domains"]):
+        raise ValueError("target-selection consistency exceeds calibration domain count")
+    if target_selection["min_loo_frequency"] > len(data["calibration_domains"]):
+        raise ValueError("target-selection LOO frequency exceeds calibration domain count")
+    if target_selection["min_lexical_domains"] > len(data["calibration_domains"]):
+        raise ValueError("target-selection lexical coverage exceeds calibration domain count")
 
     layers = _require(sweep, "layers", list)
+    coordinate_swap_layers = _require(sweep, "coordinate_swap_layers", list)
     alphas = _require(sweep, "alphas", list)
     methods = _require(sweep, "methods", list)
     transitions = _require(sweep, "directions", list)
@@ -207,6 +234,14 @@ def load_config(value: str | Path) -> PilotConfig:
         raise ValueError("layers must be non-negative integers")
     if len(layers) != len(set(layers)):
         raise ValueError("layers must be unique")
+    if (
+        not coordinate_swap_layers
+        or any(not isinstance(layer, int) or layer < 0 for layer in coordinate_swap_layers)
+        or len(coordinate_swap_layers) != len(set(coordinate_swap_layers))
+    ):
+        raise ValueError("coordinate_swap_layers must be unique non-negative integers")
+    if not set(layers) <= set(coordinate_swap_layers):
+        raise ValueError("coordinate_swap_layers must include every additive candidate layer")
     try:
         numeric_alphas = [float(alpha) for alpha in alphas]
     except (TypeError, ValueError) as exc:
@@ -233,6 +268,15 @@ def load_config(value: str | Path) -> PilotConfig:
     wrong_layer = sweep.get("wrong_layer")
     if not isinstance(wrong_layer, int) or wrong_layer < 0 or wrong_layer in layers:
         raise ValueError("wrong_layer must be a non-candidate non-negative layer")
+    wrong_layer_band = _require(sweep, "wrong_layer_band", list)
+    if (
+        len(wrong_layer_band) != len(coordinate_swap_layers)
+        or any(not isinstance(layer, int) or layer < 0 for layer in wrong_layer_band)
+        or set(wrong_layer_band) & set(layers)
+    ):
+        raise ValueError(
+            "wrong_layer_band must match coordinate-swap band width and not overlap it"
+        )
     for key in ("site_control_methods", "site_control_alphas", "coordinate_swap_alphas"):
         values = _require(sweep, key, list)
         if len(values) != len(set(values)):
@@ -244,6 +288,14 @@ def load_config(value: str | Path) -> PilotConfig:
         raise ValueError("site_control_alphas must be non-zero members of alphas")
     if any(float(value) <= 0 for value in sweep["coordinate_swap_alphas"]):
         raise ValueError("coordinate_swap_alphas must be positive")
+    observation_layer = sweep.get("thought_observation_layer")
+    if not isinstance(observation_layer, int) or observation_layer <= max(layers):
+        raise ValueError("thought_observation_layer must be after every intervention layer")
+    trace_tokens = sweep.get("thought_trace_tokens")
+    if not isinstance(trace_tokens, int) or trace_tokens <= 0:
+        raise ValueError("thought_trace_tokens must be a positive integer")
+    if target_selection["readout_layer"] != observation_layer:
+        raise ValueError("target-selection and thought-observation layers must match")
 
     if int(generation.get("max_new_tokens", 0)) <= 0:
         raise ValueError("generation.max_new_tokens must be positive")

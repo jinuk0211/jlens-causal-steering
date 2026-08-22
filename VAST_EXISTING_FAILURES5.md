@@ -1,0 +1,90 @@
+# Existing-failure five-method steering run
+
+This workflow reuses the completed TauBench baseline and reviewed trajectories
+under `/workspace/tau2-bench/data/simulations/failure-steering`. It does not run
+the baseline simulations again.
+
+The pooled `agent_behavior_error` dataset uses localized, steerable events from:
+
+- `missed_required_action`
+- `guideline_violation`
+- `incorrect_interpretation`
+- `wrong_sequence`
+- `irrelevant_tool_call`
+- `repeated_tool_call`
+- `tool_call_error`
+
+`task_failure_unlocalized` is excluded because it has no causal assistant message
+index. Previously validated `tool_call_error` repairs are reused as seeds. The
+runner fills a diverse quota of four train and four validation repairs, extracts
+CAA, MERA, SADI, ITI, and AUSteer artifacts, and runs the frozen evaluation set
+with one fixed midpoint strength per method: CAA/MERA `1.0` and
+SADI/ITI/AUSteer `10.0`. The trajectory-level validation strength sweep is
+skipped, reducing the default from 190 to 100 steered simulations. Set
+`FIXED_STRENGTH_EVALUATION_ONLY=0` to restore the three-strength validation
+selection protocol.
+
+## Vast command
+
+On a completely new instance, one command clones both repositories, installs
+the environment, downloads and checksum-verifies the six baseline JSON files
+plus the existing repair seed from Drive, and starts steering:
+
+```bash
+cd /workspace
+curl -fsSL https://raw.githubusercontent.com/jinuk0211/jlens-causal-steering/agent/jlens-thought-steering/scripts/setup_taubench_existing_failures5_fresh_vast.sh | RUN_STEERING=1 bash
+```
+
+The bootstrap restores these files automatically; Git itself still contains
+code only:
+
+```text
+/workspace/tau2-bench/data/simulations/failure-steering/train/baseline/results.json
+/workspace/tau2-bench/data/simulations/failure-steering/train/baseline/results_reviewed.json
+/workspace/tau2-bench/data/simulations/failure-steering/validation/baseline/results.json
+/workspace/tau2-bench/data/simulations/failure-steering/validation/baseline/results_reviewed.json
+/workspace/tau2-bench/data/simulations/failure-steering/evaluation/baseline/results.json
+/workspace/tau2-bench/data/simulations/failure-steering/evaluation/baseline/results_reviewed.json
+```
+
+To prepare everything without starting the long run, omit `RUN_STEERING=1`.
+If the repositories and data are already present, use the shorter update path:
+
+```bash
+cd /workspace/jlens-causal-steering
+git pull --ff-only origin agent/jlens-thought-steering
+source .venv/bin/activate
+
+export HF_TOKEN='YOUR_HF_TOKEN'
+export OPENAI_API_KEY='YOUR_OPENAI_API_KEY'
+export SIMULATION_TIMEOUT_SECONDS=1200
+
+bash scripts/run_taubench_existing_failures5.sh
+```
+
+The run is restartable. Re-running the same command preserves validated repairs,
+existing artifacts, completed simulations, and completed reviews.
+
+Progress logs:
+
+```bash
+tail -f /workspace/taubench-behavior5.log
+tail -f /workspace/jlens-remote-worker-behavior5.log
+```
+
+Outputs:
+
+- repair pairs: `/workspace/jlens-causal-steering/outputs/taubench-airline-behavior-repair-pairs.jsonl`
+- artifacts: `/workspace/jlens-artifacts/taubench-airline/agent-behavior-error/`
+- simulations: `/workspace/tau2-bench/data/simulations/failure-steering-behavior5-v1/`
+- analysis: `/workspace/tau2-bench/data/analysis/failure-steering-behavior5-v1/`
+- selected conditions: `/workspace/baselines5-selected-conditions.txt`
+
+The default repair quota can be reduced to the extractor minimum for a cheaper,
+weaker smoke run:
+
+```bash
+export REPAIR_MINIMUM_PER_SPLIT=2
+export REPAIR_MAX_PER_SPLIT=2
+bash scripts/run_taubench_existing_failures5.sh
+```
