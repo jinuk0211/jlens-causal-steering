@@ -179,6 +179,17 @@ def load_failure_steering_manifest(path: str | Path) -> FailureSteeringManifest:
                 raise ValueError("default failure steering may not hard-code turn_indices")
             if intervention.get("boundaries"):
                 raise ValueError("manifest compiler owns intervention boundaries")
+            implementation = intervention.get("implementation", "reimplementation")
+            if implementation not in {"reimplementation", "official"}:
+                raise ValueError(f"{category}.{method} has unknown implementation {implementation!r}")
+            if implementation == "official" and not intervention.get("vector_path"):
+                raise ValueError(f"{category}.{method} official baseline needs vector_path")
+            if (
+                "negative_strength" in specification
+                and specification["negative_strength"] is not None
+                and not isinstance(specification["negative_strength"], (int, float))
+            ):
+                raise ValueError(f"{category}.{method}.negative_strength must be numeric or null")
             strengths = specification.get("strengths")
             if (
                 not isinstance(strengths, list)
@@ -298,31 +309,38 @@ def compile_failure_steering_matrix(
                         intervention=positive,
                     )
                 )
-                negative_strength = float(
-                    specification.get(
-                        "negative_strength",
-                        0.0 if method == "sadi" else -strength,
+                # null disables the sign control (e.g. MERA, whose strength is an
+                # abstention threshold in (0, 1) and has no negative counterpart).
+                skip_negative = (
+                    "negative_strength" in specification
+                    and specification["negative_strength"] is None
+                )
+                if not skip_negative:
+                    negative_strength = float(
+                        specification.get(
+                            "negative_strength",
+                            0.0 if method == "sadi" else -strength,
+                        )
                     )
-                )
-                negative = {
-                    **deepcopy(template),
-                    "strength": negative_strength,
-                    "boundaries": list(boundaries),
-                }
-                negative_control_type = (
-                    "zero_dose" if negative_strength == 0.0 else "negative_direction"
-                )
-                negative_suffix = "zero" if negative_strength == 0.0 else "negative"
-                conditions.append(
-                    _condition(
-                        manifest,
-                        name=f"{stem}-{negative_suffix}",
-                        method=method,
-                        category=category,
-                        control_type=negative_control_type,
-                        intervention=negative,
+                    negative = {
+                        **deepcopy(template),
+                        "strength": negative_strength,
+                        "boundaries": list(boundaries),
+                    }
+                    negative_control_type = (
+                        "zero_dose" if negative_strength == 0.0 else "negative_direction"
                     )
-                )
+                    negative_suffix = "zero" if negative_strength == 0.0 else "negative"
+                    conditions.append(
+                        _condition(
+                            manifest,
+                            name=f"{stem}-{negative_suffix}",
+                            method=method,
+                            category=category,
+                            control_type=negative_control_type,
+                            intervention=negative,
+                        )
+                    )
                 wrong = {
                     **deepcopy(template),
                     "strength": strength,
