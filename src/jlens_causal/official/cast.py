@@ -69,6 +69,8 @@ DEVIATIONS = [
     "Vector training goes through a hidden-state view (float32, last logit only); the PCA "
     "and sign rule are upstream.",
     "find_best_condition_point reads rendered prompts directly via a respond() override.",
+    "Not a deviation, noted for readers: as upstream, vectors are read from block outputs "
+    "(hidden_states[l + 1]) but added/measured at the input of block l.",
 ]
 _NO_SPECIAL_TOKENS = SimpleNamespace(bos_token=None, eos_token=None, pad_token=None, unk_token=None)
 
@@ -240,7 +242,10 @@ def fit(
             "condition_layer_range": list(condition_layer_range),
             "condition_accumulate": "all",
             "condition_layers": [int(layer) for layer in best_layers],
+            # find_best_condition_point returns round(threshold, 3); use a 1e-3 grid so
+            # the reported F1 is the F1 of the threshold actually applied.
             "condition_threshold": float(threshold),
+            "condition_threshold_rounding": "upstream round(threshold, 3)",
             "condition_comparator_threshold_is": str(direction),
             "condition_threshold_comparison_mode": "mean",
             "condition_f1": float(f1),

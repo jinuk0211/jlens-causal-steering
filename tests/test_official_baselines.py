@@ -94,7 +94,13 @@ def test_official_manifest_compiles_with_official_dispatch():
     # MERA's strength is an abstention threshold: no sign-flipped control.
     assert not [c for c in by_method["mera"] if c["control_type"] == "negative_direction"]
     assert [c for c in by_method["sadi"] if c["control_type"] == "zero_dose"]
-    assert [c for c in by_method["caa"] if c["control_type"] == "wrong_layer"]
+    # The CAA wrong-layer control must add a fitted vector (vector_layer) at layer 4.
+    fitted = set(json.loads(OFFICIAL_CONFIG.read_text())["official_fit"]["caa"]["layers"])
+    for condition in by_method["caa"]:
+        intervention = condition["agent_llm_args"]["jlens_intervention"]
+        assert intervention["official_options"]["vector_layer"] in fitted
+    wrong = [c for c in by_method["caa"] if c["control_type"] == "wrong_layer"]
+    assert wrong and wrong[0]["agent_llm_args"]["jlens_intervention"]["layer"] == 4
 
 
 def test_render_pair_isolates_the_two_actions():
@@ -215,6 +221,9 @@ def test_end_to_end_fit_and_steer(method, tiny_runtime, tiny_pairs, tmp_path):
     if method == "caa":
         path = caa.fit(tiny_runtime, pairs, settings=settings, layers=[1, 2], behavior="tool_call_error", **common)
         trace = _generate(tiny_runtime, method, path, strength=1.0, layer=1)
+        # wrong-layer control: the layer-1 vector injected at an unfitted layer.
+        wrong = _generate(tiny_runtime, method, path, strength=1.0, layer=3, options={"vector_layer": 1})
+        assert wrong["hook_layer"] == 3 and wrong["vector_layer"] == 1 and wrong["applied_edits"] > 0
     elif method == "mera":
         path = mera.fit(tiny_runtime, pairs, seed=0, **common)
         trace = _generate(tiny_runtime, method, path, strength=0.01)
@@ -226,6 +235,9 @@ def test_end_to_end_fit_and_steer(method, tiny_runtime, tiny_pairs, tmp_path):
     elif method == "austeer":
         path = austeer.fit(tiny_runtime, pairs, **common)
         trace = _generate(tiny_runtime, method, path, strength=10.0, options={"top_k": 4})
+        ffn = _generate(tiny_runtime, method, path, strength=10.0,
+                        options={"top_k": 4, "applied_module": "ffn"})
+        assert ffn["applied_module"] == "ffn" and ffn["applied_edits"] > 0
     else:
         path = iti.fit(tiny_runtime, pairs, num_heads_to_intervene=2, seed=0, val_ratio=0.2, **common)
         if not tiny_runtime.torch.cuda.is_available():

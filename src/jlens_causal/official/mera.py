@@ -6,8 +6,9 @@ Upstream code that runs unchanged:
     transform of the error target);
   * ``probes.probes_utils.postprocess_df_probes`` and ``get_best_coefficients``
     pick each layer's lowest-RMSE coefficient vector;
-  * ``steering.by_mera.MERA`` (``optimal_probe`` mode, class-default derivation
-    flags) applies the closed-form update through its own
+  * ``steering.by_mera.MERA`` (``optimal_probe`` mode, the derivation flags
+    of the authors' runner ``steering_run.py``) applies the closed-form update
+    through its own
     ``post_attention_layernorm`` forward hooks (``with mera: generate``).
 
 What this adapter supplies:
@@ -60,7 +61,11 @@ DEVIATIONS = [
     "regression coefficients.",
     "Activations are cast to float32 around MERA.steer and back to the model dtype.",
     "Alpha is chosen by Tau2 validation task success instead of MERA.calibrate_alpha "
-    "(which assumes single-token classification datasets).",
+    "(which assumes single-token classification datasets); candidates come from the "
+    "runner's alpha_range np.linspace(1e-3, 0.99, 10).",
+    "Derivation flags default to the authors' runner (steering_run.py 'with_both': "
+    "derive_with_sigmoid=True, derive_with_logit=True), not the MERA class defaults "
+    "(sigmoid=False); the latter is selectable via official_options.",
 ]
 
 
@@ -270,7 +275,9 @@ def steer(
             "best_alpha_exact": alpha,
             "apply_token_pos_to_steer": str(options.get("apply_token_pos_to_steer", "all")),
             "derive_with_all": True,
-            "derive_with_sigmoid": bool(options.get("derive_with_sigmoid", False)),
+            # steering_run.py benchmarks only derive_settings["with_both"]; the class
+            # defaults (sigmoid=False) are selectable through official_options.
+            "derive_with_sigmoid": bool(options.get("derive_with_sigmoid", True)),
             "derive_with_logit": bool(options.get("derive_with_logit", True)),
             "log_with_wandb": False,
             "debug": False,

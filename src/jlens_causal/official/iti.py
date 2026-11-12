@@ -49,8 +49,10 @@ DEVIATIONS = [
     "Gated DeltaNet layers have no softmax heads at that site.",
     "pyvene's IntervenableModel is replaced by forward pre-hooks that call the upstream "
     "Collector and ITI_Intervener objects.",
-    "Examples are Tau2 prompt + repaired/failed action (labels 1/0) grouped per repair pair; "
-    "the std tuning set is the same activations (upstream default activations_dataset).",
+    "Examples are Tau2 prompt + repaired/failed action (labels 1/0) grouped per repair pair.",
+    "The std tuning set mirrors the upstream default activations_dataset='tqa_gen_end_q' "
+    "(activations at the end of the question, i.e. the generation position): the last token "
+    "of each training pair's rendered prompt.",
     "By default the edit is skipped on the prefill forward and applied at every decode step, "
     "matching pyvene generate(intervene_on_prompt=False) as used by the upstream evaluation.",
     "K defaults to 6 heads: the paper's 48 of 1024 Llama-7B heads scaled to the 128 "
@@ -180,8 +182,13 @@ def fit(
         num_layers, num_heads, seed, num_heads_to_intervene, False,
     )
 
-    # validate_2fold.py lines 160-175 (tuning_activations = the same dataset).
-    tuning_activations = head_wise
+    # validate_2fold.py lines 160-175.  tuning_activations follows the default
+    # activations_dataset='tqa_gen_end_q': o_proj inputs at the end of the prompt.
+    tuning_activations = rearrange(
+        _head_activations(model, runtime.tokenizer, [pair.prompt for pair in train], interveners),
+        "b l (h d) -> b l h d",
+        h=num_heads,
+    )
     top_heads_by_layer: dict[int, list[int]] = {}
     for layer, head in top_heads:
         if layer not in top_heads_by_layer:
@@ -209,6 +216,7 @@ def fit(
             "seed": int(seed),
             "val_ratio": float(val_ratio),
             "use_center_of_mass": True,
+            "tuning_activations": "last token of each training prompt (tqa_gen_end_q analogue)",
             "full_attention_layers": layers,
             "top_heads": [[int(layers[int(layer)]), int(head)] for layer, head in top_heads],
             "probe_train_pairs": [train[int(i)].pair_id for i in train_set_idxs],

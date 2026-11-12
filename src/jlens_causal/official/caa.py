@@ -254,8 +254,14 @@ def steer(
 
     helpers = upstream.import_upstream(METHOD, "utils.helpers")
     vectors = artifact["state"]["vectors"]
-    if str(layer) not in vectors:
-        raise ValueError(f"CAA artifact has no vector for layer {layer}; fit layers {sorted(vectors)}")
+    # vector_layer selects which fitted vector to add; `layer` is where it is added.
+    # They differ only for the wrong-layer control (prompting_with_steering.py's
+    # override_vector: one layer's vector injected at another layer).
+    vector_layer = int(options.get("vector_layer", layer))
+    if str(vector_layer) not in vectors:
+        raise ValueError(
+            f"CAA artifact has no vector for layer {vector_layer}; fit layers {sorted(vectors)}"
+        )
     marker = str(options.get("instruction_end", artifact["fit"]["instruction_end"]))
     end_str = torch.tensor(tokenizer.encode(marker, add_special_tokens=False))
     from_position = helpers.find_instruction_end_postion(torch.tensor(prompt_ids), end_str)
@@ -267,7 +273,9 @@ def steer(
     trace = {
         "from_position": int(from_position),
         "multiplier": float(strength),
-        "vector_norm": float(vectors[str(layer)].norm()),
+        "hook_layer": int(layer),
+        "vector_layer": vector_layer,
+        "vector_norm": float(vectors[str(vector_layer)].norm()),
         "applied_edits": 0,
     }
     scaled: dict[str, Any] = {}
@@ -278,7 +286,9 @@ def steer(
         position_ids = torch.arange(start, end, device=hidden.device).unsqueeze(0)
         if "vector" not in scaled:
             # LlamaWrapper.set_add_activations(layer, multiplier * vector)
-            scaled["vector"] = (strength * vectors[str(layer)]).to(device=hidden.device, dtype=hidden.dtype)
+            scaled["vector"] = (strength * vectors[str(vector_layer)]).to(
+                device=hidden.device, dtype=hidden.dtype
+            )
         augmented = helpers.add_vector_from_position(
             matrix=hidden, vector=scaled["vector"], position_ids=position_ids, from_pos=from_position
         )

@@ -54,6 +54,8 @@ DEVIATIONS = [
     "values of Gated DeltaNet layers are zero, so the 'heads' variant is not used.",
     "Generation applies the trace_neuron_patch rule on the prefill forward only; "
     "decode steps are unedited.",
+    "The upstream join f'{q.strip()} {a.strip()}' is kept, so at fit time the chat "
+    "template's trailing newlines after the generation header become one space.",
 ]
 
 

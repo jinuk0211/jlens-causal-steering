@@ -124,7 +124,11 @@ def main() -> int:
                 output_path=output_path, **common,
             )
         elif method == "austeer":
-            path = austeer.fit(runtime, pairs, output_path=output_path, **common)
+            path = austeer.fit(
+                runtime, pairs, output_path=output_path,
+                applied_modules=tuple(method_settings.get("applied_modules", austeer.APPLIED_MODULES)),
+                **common,
+            )
         else:  # pragma: no cover
             raise AssertionError(method)
         results[method] = str(path)
