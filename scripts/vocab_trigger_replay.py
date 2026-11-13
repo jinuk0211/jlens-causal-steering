@@ -122,6 +122,9 @@ def main() -> int:
                         help="several random-direction doses (overrides --random-alpha)")
     parser.add_argument("--always-alphas", type=float, nargs="*", default=[],
                         help="steer every turn regardless of the trigger at these doses")
+    parser.add_argument("--probe-layers", type=int, nargs="*", default=[],
+                        help="also record the risk-minus-safe score at the decision point in these "
+                             "blocks (after the control layer: shows how the edit moved the readout)")
     parser.add_argument("--max-new-tokens", type=int, default=160)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--precision", choices=["bf16-storage", "fp32", "cuda-bf16", "cuda-fp32"],
@@ -173,8 +176,9 @@ def main() -> int:
         unembed=model.get_output_embeddings().weight.detach(),
     )
     direction = concept_direction(lens, head, spec, args.control_layer)
-    # Only the observation layer's Jacobian is needed from here on.
-    lens.jacobians = {spec.observe_layer: lens.jacobians[spec.observe_layer]}
+    # Only the observation and probe layers' Jacobians are needed from here on.
+    keep = {spec.observe_layer, *args.probe_layers}
+    lens.jacobians = {layer: lens.jacobians[layer] for layer in keep}
     rand = random_direction(direction, seed=0)
     # Negative alphas push toward the risk vocabulary (the sign control).
     conditions = [("off", 0.0, direction)] + [("trigger", a, direction) for a in args.alphas]
@@ -216,7 +220,7 @@ def main() -> int:
             started = time.time()
             with torch.no_grad(), vocab_trigger_steering(
                 model, lens, head, spec, mode=mode, control_layer=args.control_layer,
-                direction=vector, alpha=alpha,
+                direction=vector, alpha=alpha, probe_layers=args.probe_layers,
             ) as trace:
                 output = model.generate(
                     input_ids=prompt, past_key_values=copy.deepcopy(cache),
@@ -236,6 +240,7 @@ def main() -> int:
                 "trigger_score": trace["score"],
                 "triggered": trace["triggered"],
                 "steered_positions": trace["steered_positions"],
+                "probe_scores": {str(layer): score for layer, score in sorted(trace["probe"].items())},
                 "label": label_calls(calls, gold),
                 "tool_calls": calls,
                 "asks_question": "?" in text and not calls,

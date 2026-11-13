@@ -102,9 +102,14 @@ class TriggerSpec:
         z = logits.float().reshape(-1)
         return float(torch.logsumexp(z[self.risk_ids], 0) - torch.logsumexp(z[self.safe_ids], 0))
 
-    def score_hidden(self, lens: Any, head: ReadoutHead, hidden: torch.Tensor) -> float:
-        """Same score from a residual, computing only the vocabulary's logits."""
-        normed = head.norm(lens.transport(hidden.float(), self.observe_layer)).reshape(-1)
+    def score_hidden(self, lens: Any, head: ReadoutHead, hidden: torch.Tensor, layer: int | None = None) -> float:
+        """Same score from a residual, computing only the vocabulary's logits.
+
+        ``layer`` reads a block other than the observation layer (probing the
+        effect of steering further down the stack).
+        """
+        layer = self.observe_layer if layer is None else layer
+        normed = head.norm(lens.transport(hidden.float(), layer)).reshape(-1)
         ids = [*self.risk_ids, *self.safe_ids]
         z = head.unembed[ids].to(device=normed.device, dtype=torch.float32) @ normed
         risk, safe = z[: len(self.risk_ids)], z[len(self.risk_ids) :]
@@ -188,11 +193,15 @@ def vocab_trigger_steering(
     control_layer: int,
     direction: torch.Tensor,
     alpha: float,
+    probe_layers: Sequence[int] = (),
 ) -> Iterator[dict[str, Any]]:
     """Detect on the first forward call of a turn (the decision point), then latch.
 
     The first forward of ``generate`` must process the last prompt token (use a
     prefix cache of ``prompt[:-1]``) so detection sees the decision position.
+    ``probe_layers`` record the same risk-minus-safe score at the decision point
+    in later blocks, i.e. after the edit, so the steering's effect on the
+    readout can be compared across conditions (``trace["probe"]``).
     """
     if mode not in {"off", "trigger", "always", "random"}:
         raise ValueError(f"unknown mode {mode!r}")
@@ -201,8 +210,17 @@ def vocab_trigger_steering(
     blocks = _blocks(model)
     trace: dict[str, Any] = {"mode": mode, "alpha": alpha, "observe_layer": spec.observe_layer,
                              "control_layer": control_layer, "score": None, "triggered": False,
-                             "steered_positions": 0, "calls": 0}
+                             "steered_positions": 0, "calls": 0, "probe": {}}
     state = {"active": mode == "always"}
+
+    def probe(layer: int) -> Any:
+        def record(module: Any, args: Any, output: Any) -> None:  # noqa: ARG001
+            if layer in trace["probe"]:
+                return
+            hidden = output if torch.is_tensor(output) else output[0]
+            trace["probe"][layer] = spec.score_hidden(lens, head, hidden[0, -1].detach(), layer)
+
+        return record
 
     def observe(module: Any, args: Any, output: Any) -> None:  # noqa: ARG001
         if trace["score"] is not None:
@@ -226,6 +244,8 @@ def vocab_trigger_steering(
 
     handles = [blocks[spec.observe_layer].register_forward_hook(observe),
                blocks[control_layer].register_forward_hook(control)]
+    # Registered after the control hook, so a probe at the control layer sees the edit.
+    handles += [blocks[layer].register_forward_hook(probe(layer)) for layer in probe_layers]
     try:
         yield trace
     finally:

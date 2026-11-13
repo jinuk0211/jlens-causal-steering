@@ -2,6 +2,9 @@
 # Vocab-trigger experiments on a vast.ai GPU:
 #   sign      +/- steering replay on held-out turns (run first: the main question)
 #   patterns  all-layer pattern analysis of the failure vocabulary (forward pass per turn)
+#   dose      +/- dose sweep on the sign-stage selection, with the readout probed after the
+#             edit (layers 20-30) to see whether the steering moves the J-lens score as signed
+#             (run after sign; not part of "all")
 # Upload the telemetry first:  scp -P <port> vocab_trigger_data.tgz root@<host>:/workspace/
 #
 # STREAM=1 is for hosts whose disk cannot hold the 9 GB checkpoint: the weights are
@@ -14,7 +17,9 @@ ROOT="${ROOT:-/workspace}"
 REPO="$ROOT/jlens-causal-steering"
 REF="${REF:-agent/official-baselines-tau2}"
 DATA="$ROOT/vocab-trigger-data"
-STAGE="${STAGE:-all}"            # sign | patterns | all
+STAGE="${STAGE:-all}"            # sign | patterns | all | dose
+DOSES="${DOSES:-0.2 -0.2 0.4 -0.4 0.8 -0.8}"
+RANDOM_DOSES="${RANDOM_DOSES:-0.8 -0.8}"
 ALPHA="${ALPHA:-0.4}"
 PRECISION="${PRECISION:-cuda-fp32}"   # cuda-bf16 on Ampere+; Turing (2080 Ti) has no fast bf16
 PATTERN_DTYPE="${PATTERN_DTYPE:-float32}"
@@ -109,5 +114,15 @@ if [[ "$STAGE" == patterns || "$STAGE" == all ]]; then
   python scripts/vocab_trigger_patterns.py "$TEL" "$TASKS" --model-dir "$MODEL" --lens "$LENS" \
     --recompute --device cuda --dtype "$PATTERN_DTYPE" --max-turns "$PATTERN_TURNS" "${STREAM_FLAG[@]}" \
     --output "$OUT/patterns_all_layers.json" | tee "$OUT/patterns_all_layers.log"
+fi
+
+if [[ "$STAGE" == dose ]]; then
+  read -r -a dose_list <<< "$DOSES"
+  read -r -a random_list <<< "$RANDOM_DOSES"
+  python scripts/vocab_trigger_replay.py "$OUT/sign_triggered.jsonl" "$SPEC" "$TASKS" \
+    --model-dir "$MODEL" --lens "$LENS" --precision "$PRECISION" --prefill-chunk 4096 "${STREAM_FLAG[@]}" \
+    --alphas "${dose_list[@]}" --random-alphas "${random_list[@]}" --probe-layers 20 24 28 30 \
+    --cap-to-logged --max-new-tokens 800 --output "$OUT/dose_triggered_results.jsonl"
+  python scripts/vocab_trigger_sign_report.py "$OUT/dose_triggered_results.jsonl" | tee "$OUT/dose_report.txt"
 fi
 echo "done: $REPO/$OUT"
