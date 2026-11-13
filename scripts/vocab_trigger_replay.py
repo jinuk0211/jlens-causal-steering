@@ -115,11 +115,17 @@ def main() -> int:
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--lens", type=Path, required=True)
     parser.add_argument("--control-layer", type=int, default=20)
-    parser.add_argument("--alphas", type=float, nargs="+", default=[0.1, 0.2])
+    parser.add_argument("--alphas", type=float, nargs="*", default=[0.1, 0.2],
+                        help="trigger-gated doses; negative values push toward the risk vocabulary")
     parser.add_argument("--random-alpha", type=float, default=0.2)
+    parser.add_argument("--random-alphas", type=float, nargs="+",
+                        help="several random-direction doses (overrides --random-alpha)")
+    parser.add_argument("--always-alphas", type=float, nargs="*", default=[],
+                        help="steer every turn regardless of the trigger at these doses")
     parser.add_argument("--max-new-tokens", type=int, default=160)
     parser.add_argument("--threads", type=int, default=8)
-    parser.add_argument("--precision", choices=["bf16-storage", "fp32"], default="bf16-storage")
+    parser.add_argument("--precision", choices=["bf16-storage", "fp32", "cuda-bf16"], default="bf16-storage",
+                        help="cuda-bf16 on a GPU host; the CPU options keep fp32 compute")
     parser.add_argument("--limit", type=int, help="replay only the first N selected turns")
     parser.add_argument("--prefill-chunk", type=int, default=2048)
     parser.add_argument("--cap-to-logged", action="store_true",
@@ -132,16 +138,18 @@ def main() -> int:
     torch.set_num_threads(args.threads)
     tasks = {str(t["id"]): t for t in json.loads(args.tasks.read_text(encoding="utf-8"))}
     spec = TriggerSpec.load(args.trigger)
-    if args.precision == "fp32":
+    if args.precision in {"fp32", "cuda-bf16"}:
         from jlens_causal.modeling import load_hf_runtime
 
         runtime = load_hf_runtime({
             "model_id": "Qwen/Qwen3.5-4B", "local_path": str(args.model_dir), "text_only": True,
-            "dtype": "float32", "device": "cpu",
+            "dtype": "float32" if args.precision == "fp32" else "bfloat16",
+            "device": "cpu" if args.precision == "fp32" else "cuda",
         })
         model, tokenizer = runtime.hf_model, runtime.tokenizer
     else:
         model, tokenizer = load_bf16_storage_fp32_compute(args.model_dir)
+    device = next(model.parameters()).device
     lens = jlens.JacobianLens.load(str(args.lens))
     text_model = model.model
     # The unembedding stays in the model's storage dtype; logits are computed in fp32.
@@ -154,8 +162,11 @@ def main() -> int:
     # Only the observation layer's Jacobian is needed from here on.
     lens.jacobians = {spec.observe_layer: lens.jacobians[spec.observe_layer]}
     rand = random_direction(direction, seed=0)
+    # Negative alphas push toward the risk vocabulary (the sign control).
     conditions = [("off", 0.0, direction)] + [("trigger", a, direction) for a in args.alphas]
-    conditions.append(("random", args.random_alpha, rand))
+    random_alphas = args.random_alphas if args.random_alphas is not None else [args.random_alpha]
+    conditions += [("random", a, rand) for a in random_alphas]
+    conditions += [("always", a, direction) for a in args.always_alphas]
 
     done = set()
     if args.output.is_file():
@@ -168,7 +179,7 @@ def main() -> int:
     for turn in selection:
         record = load_record(turn["telemetry_path"], turn["record_id"])
         gold = tasks[str(record["task_id"])]["evaluation_criteria"]["actions"]
-        prompt = torch.tensor([record["input_ids"]])
+        prompt = torch.tensor([record["input_ids"]], device=device)
         # Enough tokens to reproduce the logged action (plus slack), capped.
         max_new = min(args.max_new_tokens, len(record["generated_ids"]) + 24) if args.cap_to_logged \
             else args.max_new_tokens

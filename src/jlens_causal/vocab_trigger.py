@@ -121,7 +121,7 @@ class TriggerSpec:
 def concept_direction(lens: Any, head: ReadoutHead, spec: TriggerSpec, control_layer: int) -> torch.Tensor:
     """normalize(J_c^T (mean W_U[safe] - mean W_U[risk])) in the control layer's basis."""
     target = head.unembed[spec.safe_ids].float().mean(0) - head.unembed[spec.risk_ids].float().mean(0)
-    direction = lens.jacobians[control_layer].float().T @ target
+    direction = lens.jacobians[control_layer].float().T @ target.cpu()
     return direction / direction.norm()
 
 

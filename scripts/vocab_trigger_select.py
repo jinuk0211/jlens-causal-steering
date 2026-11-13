@@ -30,6 +30,9 @@ def main() -> int:
     parser.add_argument("--lens", type=Path, required=True)
     parser.add_argument("--splits", nargs="+", default=["validation", "evaluation"])
     parser.add_argument("--labels", nargs="+", default=["bad_write", "good_write"])
+    parser.add_argument("--untriggered", action="store_true",
+                        help="select turns whose score stays below the threshold instead")
+    parser.add_argument("--max-turns", type=int)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -47,11 +50,13 @@ def main() -> int:
             if turn["split"] not in args.splits or turn["label"] not in args.labels or residual is None:
                 continue
             score = spec.score(lens_logits(lens, head, residual, spec.observe_layer))
-            if score > spec.threshold:
+            if (score > spec.threshold) != args.untriggered:
                 rows.append({key: turn[key] for key in ("split", "simulation", "task_id", "turn_index",
                                                         "record_id", "telemetry_path", "label")}
                             | {"offline_score": score})
     rows.sort(key=lambda row: (row["label"] != "bad_write", row["split"], row["record_id"]))
+    if args.max_turns:
+        rows = rows[: args.max_turns]
     with args.output.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
