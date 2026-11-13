@@ -27,9 +27,15 @@ cd "$REPO"
 source .venv/bin/activate
 # PyPI's torch 2.8 wheel is the CUDA 12.8 build; its nvidia-* deps also come from PyPI
 # (the download.pytorch.org index pulls them from pypi.nvidia.com, which can time out).
-python -c "import torch" 2>/dev/null || \
-  python -m pip install -q --retries 10 --timeout 120 "torch==2.8.0"
-python -m pip install -q --retries 10 --timeout 120 -e . 2>&1 | tail -n 2
+# uv downloads packages in parallel, which matters on hosts with slow single connections.
+if command -v uv >/dev/null; then
+  python -c "import torch" 2>/dev/null || uv pip install -q --python .venv/bin/python "torch==2.8.0"
+  uv pip install -q --python .venv/bin/python -e .
+else
+  python -c "import torch" 2>/dev/null || \
+    python -m pip install -q --retries 10 --timeout 120 "torch==2.8.0"
+  python -m pip install -q --retries 10 --timeout 120 -e . 2>&1 | tail -n 2
+fi
 
 export HF_HOME="${HF_HOME:-$ROOT/.hf_home}"
 read -r MODEL LENS < <(python - <<'PY'
@@ -37,7 +43,8 @@ from huggingface_hub import snapshot_download
 lens = snapshot_download("neuronpedia/jacobian-lens", revision="a4114d7752d11eb546e6cf372213d7e75526d3a1",
                          allow_patterns=["qwen3.5-4b/jlens/Salesforce-wikitext/Qwen3.5-4B_jacobian_lens_n1000.pt"])
 model = snapshot_download("Qwen/Qwen3.5-4B", revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
-                          allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "tokenizer*"])
+                          allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "tokenizer*"],
+                          max_workers=16)
 print(model, lens + "/qwen3.5-4b/jlens/Salesforce-wikitext/Qwen3.5-4B_jacobian_lens_n1000.pt")
 PY
 )
