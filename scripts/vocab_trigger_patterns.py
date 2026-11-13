@@ -23,7 +23,7 @@ from pathlib import Path
 
 import torch
 
-from jlens_causal.vocab_trigger import load_readout_head
+from jlens_causal.vocab_trigger import ReadoutHead, load_readout_head
 
 
 def _mine_module():
@@ -34,15 +34,33 @@ def _mine_module():
     return module
 
 
-def recompute_residuals(turns: list[dict], model_dir: Path, device: str, dtype: str = "bfloat16") -> list[int]:
-    """Forward each turn's logged prompt once and keep the last position of every block."""
+def recompute_residuals(turns: list[dict], model_dir: Path, device: str, dtype: str = "bfloat16",
+                        stream: bool = False) -> tuple[list[int], ReadoutHead]:
+    """Forward each turn's logged prompt once and keep the last position of every block.
+
+    Also returns the model's own readout head, so ``--stream-weights`` hosts never
+    need the checkpoint on disk.
+    """
     from transformers import Qwen3_5Config, Qwen3_5ForCausalLM
 
-    config = Qwen3_5Config.from_pretrained(model_dir).text_config
-    model = Qwen3_5ForCausalLM.from_pretrained(
-        model_dir, config=config, dtype=getattr(torch, dtype),
-        key_mapping={r"^model\.language_model\.": "model."},
-    ).to(device).eval()
+    if stream:
+        from jlens_causal.hf_stream import stream_qwen35_text_model
+
+        model = stream_qwen35_text_model(
+            "Qwen/Qwen3.5-4B", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a", model_dir,
+            device=device, dtype=getattr(torch, dtype),
+        )
+    else:
+        config = Qwen3_5Config.from_pretrained(model_dir).text_config
+        model = Qwen3_5ForCausalLM.from_pretrained(
+            model_dir, config=config, dtype=getattr(torch, dtype),
+            key_mapping={r"^model\.language_model\.": "model."},
+        ).to(device).eval()
+    head = ReadoutHead(
+        norm_weight=model.model.norm.weight.detach().float().cpu(),
+        eps=float(model.config.rms_norm_eps),
+        unembed=model.get_output_embeddings().weight.detach().to(torch.bfloat16).cpu(),
+    )
     blocks = model.model.layers
     captured: dict[int, torch.Tensor] = {}
 
@@ -67,8 +85,11 @@ def recompute_residuals(turns: list[dict], model_dir: Path, device: str, dtype: 
     finally:
         for handle in handles:
             handle.remove()
-    del model
-    return list(range(len(blocks)))
+    layers = list(range(len(blocks)))
+    del model, blocks
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return layers, head
 
 
 def main() -> int:
@@ -83,6 +104,9 @@ def main() -> int:
                         help="recompute precision (float32 on pre-Ampere GPUs)")
     parser.add_argument("--max-turns", type=int,
                         help="recompute on all bad writes plus a random sample of other turns")
+    parser.add_argument("--stream-weights", action="store_true",
+                        help="with --recompute: stream the weights from the Hub into GPU memory "
+                             "(--model-dir then only needs config/tokenizer files)")
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--vocab-size", type=int, default=8)
     parser.add_argument("--min-support", type=int, default=3)
@@ -106,14 +130,14 @@ def main() -> int:
             turns = bad + [rest[i] for i in sorted(keep)]
         # Compare against the telemetry's own layer-16 residual as a numerics check.
         reference = {t["record_id"]: t["residuals"].get(("initial_decision", 16)) for t in turns}
-        layers = recompute_residuals(turns, args.model_dir, args.device, args.dtype)
+        layers, head = recompute_residuals(turns, args.model_dir, args.device, args.dtype, args.stream_weights)
         sims = [float(torch.nn.functional.cosine_similarity(
                     t["residuals"][("initial_decision", 16)].float(), reference[t["record_id"]].float(), dim=0))
                 for t in turns if reference[t["record_id"]] is not None]
         print(f"recomputed vs logged layer-16 residual: min cos {min(sims):.4f}, mean {sum(sims) / len(sims):.4f}")
     else:
         layers = sorted({layer for t in turns for (site, layer) in t["residuals"] if site == "initial_decision"})
-    head = load_readout_head(args.model_dir)
+        head = load_readout_head(args.model_dir)
     lens = jlens.JacobianLens.load(str(args.lens))
     device = args.device
     unembed = head.unembed.to(device)

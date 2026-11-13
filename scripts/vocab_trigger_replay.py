@@ -129,6 +129,9 @@ def main() -> int:
                         help="cuda-* on a GPU host (cuda-fp32 for pre-Ampere GPUs); the CPU options keep fp32 compute")
     parser.add_argument("--limit", type=int, help="replay only the first N selected turns")
     parser.add_argument("--prefill-chunk", type=int, default=2048)
+    parser.add_argument("--stream-weights", action="store_true",
+                        help="stream Qwen3.5-4B weights from the Hub into GPU memory "
+                             "(--model-dir then only needs config/tokenizer files)")
     parser.add_argument("--cap-to-logged", action="store_true",
                         help="stop at the logged completion length + 24 tokens")
     parser.add_argument("--output", type=Path, required=True)
@@ -139,7 +142,17 @@ def main() -> int:
     torch.set_num_threads(args.threads)
     tasks = {str(t["id"]): t for t in json.loads(args.tasks.read_text(encoding="utf-8"))}
     spec = TriggerSpec.load(args.trigger)
-    if args.precision in {"fp32", "cuda-bf16", "cuda-fp32"}:
+    if args.stream_weights:
+        from transformers import AutoTokenizer
+
+        from jlens_causal.hf_stream import stream_qwen35_text_model
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+        model = stream_qwen35_text_model(
+            "Qwen/Qwen3.5-4B", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a", args.model_dir,
+            device="cuda", dtype=torch.float32 if args.precision == "cuda-fp32" else torch.bfloat16,
+        )
+    elif args.precision in {"fp32", "cuda-bf16", "cuda-fp32"}:
         from jlens_causal.modeling import load_hf_runtime
 
         runtime = load_hf_runtime({
