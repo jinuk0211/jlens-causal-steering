@@ -35,7 +35,7 @@ def _mine_module():
 
 
 def recompute_residuals(turns: list[dict], model_dir: Path, device: str, dtype: str = "bfloat16",
-                        stream: bool = False) -> tuple[list[int], ReadoutHead]:
+                        stream: bool = False, chunk: int = 4096) -> tuple[list[int], ReadoutHead]:
     """Forward each turn's logged prompt once and keep the last position of every block.
 
     Also returns the model's own readout head, so ``--stream-weights`` hosts never
@@ -77,7 +77,14 @@ def recompute_residuals(turns: list[dict], model_dir: Path, device: str, dtype: 
             for number, turn in enumerate(turns, 1):
                 record = next(json.loads(line) for line in open(turn["telemetry_path"], encoding="utf-8")
                               if json.loads(line)["record_id"] == turn["record_id"])
-                model.model(input_ids=torch.tensor([record["input_ids"]], device=device))
+                ids = torch.tensor([record["input_ids"]], device=device)
+                # Chunked with a cache: the hooks keep the last position of the final chunk,
+                # and peak memory stays bounded for 10k+ token prompts.
+                cache = None
+                for start in range(0, ids.shape[1], chunk):
+                    cache = model.model(input_ids=ids[:, start : start + chunk],
+                                        past_key_values=cache, use_cache=True).past_key_values
+                del cache
                 for layer, value in captured.items():
                     turn["residuals"][("initial_decision", layer)] = value
                 if number % 100 == 0:
@@ -107,6 +114,8 @@ def main() -> int:
     parser.add_argument("--stream-weights", action="store_true",
                         help="with --recompute: stream the weights from the Hub into GPU memory "
                              "(--model-dir then only needs config/tokenizer files)")
+    parser.add_argument("--prefill-chunk", type=int, default=4096,
+                        help="recompute forward in chunks of this many tokens (bounds GPU memory)")
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--vocab-size", type=int, default=8)
     parser.add_argument("--min-support", type=int, default=3)
@@ -130,7 +139,8 @@ def main() -> int:
             turns = bad + [rest[i] for i in sorted(keep)]
         # Compare against the telemetry's own layer-16 residual as a numerics check.
         reference = {t["record_id"]: t["residuals"].get(("initial_decision", 16)) for t in turns}
-        layers, head = recompute_residuals(turns, args.model_dir, args.device, args.dtype, args.stream_weights)
+        layers, head = recompute_residuals(turns, args.model_dir, args.device, args.dtype,
+                                           args.stream_weights, args.prefill_chunk)
         sims = [float(torch.nn.functional.cosine_similarity(
                     t["residuals"][("initial_decision", 16)].float(), reference[t["record_id"]].float(), dim=0))
                 for t in turns if reference[t["record_id"]] is not None]
