@@ -25,9 +25,11 @@ mkdir -p "$DATA"
 cd "$REPO"
 [[ -x .venv/bin/python ]] || python3 -m venv .venv
 source .venv/bin/activate
+# PyPI's torch 2.8 wheel is the CUDA 12.8 build; its nvidia-* deps also come from PyPI
+# (the download.pytorch.org index pulls them from pypi.nvidia.com, which can time out).
 python -c "import torch" 2>/dev/null || \
-  python -m pip install -q --index-url https://download.pytorch.org/whl/cu128 "torch==2.8.0"
-python -m pip install -q -e . 2>&1 | tail -n 2
+  python -m pip install -q --retries 10 --timeout 120 "torch==2.8.0"
+python -m pip install -q --retries 10 --timeout 120 -e . 2>&1 | tail -n 2
 
 export HF_HOME="${HF_HOME:-$ROOT/.hf_home}"
 read -r MODEL LENS < <(python - <<'PY'
