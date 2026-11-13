@@ -139,8 +139,28 @@ def main() -> int:
             turns = bad + [rest[i] for i in sorted(keep)]
         # Compare against the telemetry's own layer-16 residual as a numerics check.
         reference = {t["record_id"]: t["residuals"].get(("initial_decision", 16)) for t in turns}
-        layers, head = recompute_residuals(turns, args.model_dir, args.device, args.dtype,
-                                           args.stream_weights, args.prefill_chunk)
+        # The forward passes are the expensive part: keep them (and the readout head) on disk.
+        cache_path = args.output.with_suffix(".residuals.pt")
+        if cache_path.is_file():
+            saved = torch.load(cache_path)
+            layers = saved["layers"]
+            head = ReadoutHead(**saved["head"])
+            rows = {rid: i for i, rid in enumerate(saved["record_ids"])}
+            for turn in turns:
+                stacked = saved["residuals"][rows[turn["record_id"]]]
+                for layer in layers:
+                    turn["residuals"][("initial_decision", layer)] = stacked[layer].float()
+            print(f"loaded recomputed residuals from {cache_path}")
+        else:
+            layers, head = recompute_residuals(turns, args.model_dir, args.device, args.dtype,
+                                               args.stream_weights, args.prefill_chunk)
+            torch.save({
+                "layers": layers,
+                "record_ids": [t["record_id"] for t in turns],
+                "residuals": torch.stack([torch.stack([t["residuals"][("initial_decision", layer)]
+                                                       for layer in layers]) for t in turns]),
+                "head": {"norm_weight": head.norm_weight, "eps": head.eps, "unembed": head.unembed},
+            }, cache_path)
         sims = [float(torch.nn.functional.cosine_similarity(
                     t["residuals"][("initial_decision", 16)].float(), reference[t["record_id"]].float(), dim=0))
                 for t in turns if reference[t["record_id"]] is not None]
@@ -150,7 +170,7 @@ def main() -> int:
         head = load_readout_head(args.model_dir)
     lens = jlens.JacobianLens.load(str(args.lens))
     device = args.device
-    unembed = head.unembed.to(device)
+    unembed = head.unembed.to(device=device, dtype=torch.float32)
     is_bad = torch.tensor([t["label"] == "bad_write" for t in turns])
     split = [t["split"] for t in turns]
     train_idx = [i for i, s in enumerate(split) if s == "train"]
