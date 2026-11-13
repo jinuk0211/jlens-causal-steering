@@ -124,8 +124,9 @@ def main() -> int:
                         help="steer every turn regardless of the trigger at these doses")
     parser.add_argument("--max-new-tokens", type=int, default=160)
     parser.add_argument("--threads", type=int, default=8)
-    parser.add_argument("--precision", choices=["bf16-storage", "fp32", "cuda-bf16"], default="bf16-storage",
-                        help="cuda-bf16 on a GPU host; the CPU options keep fp32 compute")
+    parser.add_argument("--precision", choices=["bf16-storage", "fp32", "cuda-bf16", "cuda-fp32"],
+                        default="bf16-storage",
+                        help="cuda-* on a GPU host (cuda-fp32 for pre-Ampere GPUs); the CPU options keep fp32 compute")
     parser.add_argument("--limit", type=int, help="replay only the first N selected turns")
     parser.add_argument("--prefill-chunk", type=int, default=2048)
     parser.add_argument("--cap-to-logged", action="store_true",
@@ -138,12 +139,12 @@ def main() -> int:
     torch.set_num_threads(args.threads)
     tasks = {str(t["id"]): t for t in json.loads(args.tasks.read_text(encoding="utf-8"))}
     spec = TriggerSpec.load(args.trigger)
-    if args.precision in {"fp32", "cuda-bf16"}:
+    if args.precision in {"fp32", "cuda-bf16", "cuda-fp32"}:
         from jlens_causal.modeling import load_hf_runtime
 
         runtime = load_hf_runtime({
             "model_id": "Qwen/Qwen3.5-4B", "local_path": str(args.model_dir), "text_only": True,
-            "dtype": "float32" if args.precision == "fp32" else "bfloat16",
+            "dtype": "bfloat16" if args.precision == "cuda-bf16" else "float32",
             "device": "cpu" if args.precision == "fp32" else "cuda",
         })
         model, tokenizer = runtime.hf_model, runtime.tokenizer

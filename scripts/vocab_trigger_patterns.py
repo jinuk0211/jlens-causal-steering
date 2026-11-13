@@ -34,13 +34,13 @@ def _mine_module():
     return module
 
 
-def recompute_residuals(turns: list[dict], model_dir: Path, device: str) -> list[int]:
+def recompute_residuals(turns: list[dict], model_dir: Path, device: str, dtype: str = "bfloat16") -> list[int]:
     """Forward each turn's logged prompt once and keep the last position of every block."""
     from transformers import Qwen3_5Config, Qwen3_5ForCausalLM
 
     config = Qwen3_5Config.from_pretrained(model_dir).text_config
     model = Qwen3_5ForCausalLM.from_pretrained(
-        model_dir, config=config, dtype=torch.bfloat16,
+        model_dir, config=config, dtype=getattr(torch, dtype),
         key_mapping={r"^model\.language_model\.": "model."},
     ).to(device).eval()
     blocks = model.model.layers
@@ -79,6 +79,10 @@ def main() -> int:
     parser.add_argument("--lens", type=Path, required=True)
     parser.add_argument("--recompute", action="store_true", help="forward pass for all layers (GPU)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"],
+                        help="recompute precision (float32 on pre-Ampere GPUs)")
+    parser.add_argument("--max-turns", type=int,
+                        help="recompute on all bad writes plus a random sample of other turns")
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--vocab-size", type=int, default=8)
     parser.add_argument("--min-support", type=int, default=3)
@@ -94,7 +98,19 @@ def main() -> int:
     turns = mine.load_turns(args.telemetry_root, tasks)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
     if args.recompute:
-        layers = recompute_residuals(turns, args.model_dir, args.device)
+        if args.max_turns:
+            bad = [t for t in turns if t["label"] == "bad_write"]
+            rest = [t for t in turns if t["label"] != "bad_write"]
+            generator = torch.Generator().manual_seed(0)
+            keep = torch.randperm(len(rest), generator=generator)[: max(0, args.max_turns - len(bad))].tolist()
+            turns = bad + [rest[i] for i in sorted(keep)]
+        # Compare against the telemetry's own layer-16 residual as a numerics check.
+        reference = {t["record_id"]: t["residuals"].get(("initial_decision", 16)) for t in turns}
+        layers = recompute_residuals(turns, args.model_dir, args.device, args.dtype)
+        sims = [float(torch.nn.functional.cosine_similarity(
+                    t["residuals"][("initial_decision", 16)].float(), reference[t["record_id"]].float(), dim=0))
+                for t in turns if reference[t["record_id"]] is not None]
+        print(f"recomputed vs logged layer-16 residual: min cos {min(sims):.4f}, mean {sum(sims) / len(sims):.4f}")
     else:
         layers = sorted({layer for t in turns for (site, layer) in t["residuals"] if site == "initial_decision"})
     head = load_readout_head(args.model_dir)
@@ -130,7 +146,9 @@ def main() -> int:
                 rest_counts.update(tokens)
                 n_rest += 1
 
-        def log_odds(token: int) -> float:
+        # Bind this layer's counts: the closure is reused after the loop (families).
+        def log_odds(token: int, bad_counts=bad_counts, rest_counts=rest_counts,
+                     n_bad=n_bad, n_rest=n_rest) -> float:
             a, b = bad_counts[token] + 0.5, rest_counts[token] + 0.5
             return math.log(a / (n_bad + 1)) - math.log(b / (n_rest + 1))
 
