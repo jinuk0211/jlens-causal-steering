@@ -159,6 +159,38 @@ def build_ab_items(tokenizer: Any, pairs: list[RenderedPair], settings: RenderSe
     return items
 
 
+def build_ab_items_from_rendered(examples: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """A/B items from exact rendered prompts (e.g. the logged Tau2 ``rendered_context``).
+
+    Each example holds ``prompt`` (ending in the assistant generation header),
+    ``positive`` and ``negative`` assistant messages.  The choice question is
+    inserted as a user turn right before the generation header, which is what
+    :func:`build_ab_items` renders through the chat template.
+    """
+    items = []
+    for index, example in enumerate(examples):
+        prompt = example["prompt"]
+        cut = prompt.rfind(INSTRUCTION_END)
+        if cut < 0:
+            raise ValueError("rendered prompt has no assistant generation header")
+        history, header = prompt[:cut], prompt[cut:]
+        positive_first = index % 2 == 0
+        first, second = (
+            (example["positive"], example["negative"])
+            if positive_first
+            else (example["negative"], example["positive"])
+        )
+        question = CHOICE_TEMPLATE.format(a=action_text(first), b=action_text(second))
+        items.append(
+            {
+                "question": f"{history}<|im_start|>user\n{question}<|im_end|>\n{header}",
+                "answer_matching_behavior": "(A)" if positive_first else "(B)",
+                "answer_not_matching_behavior": "(B)" if positive_first else "(A)",
+            }
+        )
+    return items
+
+
 def fit(
     runtime: Any,
     pairs: list[RenderedPair],
@@ -170,17 +202,43 @@ def fit(
     model_id: str,
     model_revision: str,
 ) -> Path:
-    torch = runtime.torch
     train = [pair for pair in pairs if pair.split == "train"]
     if len(train) < 2:
         raise ValueError("CAA needs at least two training repair pairs")
+    return fit_items(
+        runtime,
+        build_ab_items(runtime.tokenizer, train, settings),
+        layers=layers,
+        behavior=behavior,
+        output_path=output_path,
+        model_id=model_id,
+        model_revision=model_revision,
+        data=pair_summary(train),
+    )
+
+
+def fit_items(
+    runtime: Any,
+    items: list[dict[str, str]],
+    *,
+    layers: list[int],
+    behavior: str,
+    output_path: Path,
+    model_id: str,
+    model_revision: str,
+    data: dict[str, Any],
+    extra_deviations: tuple[str, ...] = (),
+) -> Path:
+    """Run ``generate_save_vectors_for_behavior`` on prepared A/B items."""
+    torch = runtime.torch
+    if len(items) < 2:
+        raise ValueError("CAA needs at least two A/B items")
     generate_vectors = upstream.import_upstream(METHOD, "generate_vectors")
     with tempfile.TemporaryDirectory(prefix="caa-official-") as scratch:
         scratch_path = Path(scratch)
         tokenizer_dir = scratch_path / "tokenizer"
         runtime.tokenizer.save_pretrained(tokenizer_dir)
         dataset_path = scratch_path / "generate_dataset.json"
-        items = build_ab_items(runtime.tokenizer, train, settings)
         dataset_path.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
         vector_dir = scratch_path / "vectors"
         vector_dir.mkdir()
@@ -227,13 +285,13 @@ def fit(
             "extraction_position": "token -2 (answer letter) of the A/B prompt",
             "application": "add_vector_from_position from the last instruction-end token",
             "instruction_end": INSTRUCTION_END,
-            "data": pair_summary(train),
+            "data": data,
             "letter_balance": {
                 "A": sum(item["answer_matching_behavior"] == "(A)" for item in items),
                 "B": sum(item["answer_matching_behavior"] == "(B)" for item in items),
             },
         },
-        deviations=DEVIATIONS,
+        deviations=[*DEVIATIONS, *extra_deviations],
         state={"vectors": vectors},
     )
     return save_artifact(torch, artifact, output_path)
