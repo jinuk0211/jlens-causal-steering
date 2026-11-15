@@ -88,7 +88,9 @@ Python 3.10+ and a CUDA PyTorch environment capable of loading Qwen3.5-4B are
 required for execution.
 
 ```bash
-git clone https://github.com/jinuk0211/jlens-causal-steering.git
+# --recurse-submodules also checks out the six baselines' original code at the
+# pinned commits (third_party/upstream; see OFFICIAL_BASELINES.md)
+git clone --recurse-submodules https://github.com/jinuk0211/jlens-causal-steering.git
 git clone https://github.com/jinuk0211/ToolAlignBench.git
 cd jlens-causal-steering
 python -m venv --system-site-packages .venv

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Clone each baseline's original repository at its pinned commit into
-# third_party/upstream (git-ignored).  SADI, MERA and AUSteer publish no
-# license, so their code is fetched here and never committed to this repo.
+# third_party/upstream.  Those paths are git submodules of this repository
+# (only URL + commit are recorded; SADI, MERA and AUSteer publish no license,
+# so their code is never copied here).  `git submodule update --init` gives
+# the same checkouts; this script makes shallow clones instead and skips
+# CAA's ~280 MB of result files.
 set -Eeuo pipefail
 
 ROOT="${JLENS_UPSTREAM_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/third_party/upstream}"

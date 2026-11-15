@@ -18,9 +18,19 @@ re-implementation is untouched and remains selectable
 | ITI | likenneth/honest_llama | `2c6b2179be7b5aa8f0a171688cf9e01b812ca327` | MIT |
 | AUSteer | zijian678/AUSteer | `d6573876734f662824062a69c5b9dee31ae57f81` | none published |
 
-Three repositories publish no license, so **no upstream code is committed
-here**.  `scripts/fetch_official_upstreams.sh` clones every repository at the
-commit above into `third_party/upstream/` (git-ignored).  At import time,
+Each repository is a **git submodule** under `third_party/upstream/`, pinned
+to the commit above. A submodule records only the URL and the commit, so **no
+upstream code is copied into this repository**; that matters because three
+of the six publish no license.
+
+Get the exact original code in one of two ways:
+
+* `git clone --recurse-submodules …`, or `git submodule update --init` in an
+  existing clone;
+* `scripts/fetch_official_upstreams.sh`, which makes shallow clones and skips
+  CAA's ~280 MB of result files.
+
+At import time,
 `jlens_causal.official.upstream` refuses any checkout that is not at the
 pinned commit.  Every artifact records the SHA-256 of each upstream file that
 produced it.

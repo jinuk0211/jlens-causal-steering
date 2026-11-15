@@ -2,9 +2,10 @@
 
 The official baselines call code from each paper's own repository.  Three of
 those repositories carry no license, so their code is never copied into this
-repository: ``scripts/fetch_official_upstreams.sh`` clones every source at the
-commit pinned below into ``third_party/upstream`` (git-ignored), and the
-adapters import it from there at runtime.
+repository.  Each source is a git submodule under ``third_party/upstream``
+pinned to the commit below (``git submodule update --init``, or the shallow
+``scripts/fetch_official_upstreams.sh``), and the adapters import it from
+there at runtime.
 
 Several upstreams use generic top-level module names (``utils``, ``steering``,
 ``tasks`` ...).  Imports therefore run with the checkout first on ``sys.path``
@@ -121,11 +122,13 @@ def checkout(method: str) -> Path:
     """Return the verified checkout for ``method`` or explain how to fetch it."""
     source = UPSTREAMS[method]
     path = upstream_root() / source.directory
-    if not path.is_dir():
+    # An uninitialised submodule is an empty directory; git -C would then
+    # report the superproject's HEAD, so check for content first.
+    if not path.is_dir() or not any(path.iterdir()):
         raise FileNotFoundError(
             f"{source.repository} is not checked out at {path}; run "
-            "scripts/fetch_official_upstreams.sh (or set "
-            f"{UPSTREAM_ROOT_ENV})"
+            "`git submodule update --init` or scripts/fetch_official_upstreams.sh "
+            f"(or set {UPSTREAM_ROOT_ENV})"
         )
     commit = _checkout_commit(path)
     if commit != source.commit:
