@@ -160,16 +160,27 @@ turns; AUC is reported on the held-out splits.
 
   The success state reads as *ask first* (L11–19), *look it up* (L20–24) and
   *let the user* (L25–31).
-* **Similar words.** Each enriched token comes with its family:
-  morphological variants plus translations.
-  * " apologize" → apologise / apologized / apologies / apology / 道歉, each
-    enriched in bad writes (log-odds +1.7 to +2.8).
-  * Proceed → proceeds / proceeding / proceeded.
-  * Understanding → understand / 理解.
-  * On the other side, " lets" → let / letting / \tlet (log-odds −1.1 to −1.6).
+* **Similar words.** The per-layer vocabularies keep returning to a few
+  concepts, each as a family of inflections and translations, and each family
+  occupies its own band of layers:
+  * risk side: compliance / request (L11–20); acknowledge, 承认 (L16–25);
+    proceed, 将进行 (L21–30); apology in English, Chinese and Japanese
+    (most layers from L13 to L31);
+  * safe side: ask / 请问 / 请您先 (L9–19); look-up words such as 找到了,
+    查看了, Looking (L18–25); let / 让用户 (L22–30).
 
-  A family-level trigger (pooling each family) should be more robust than the
-  single-token vocabulary.
+  The unembedding neighbours of a risk token are its inflections and
+  translations (for " apologize": apologise / apologized / apologies / apology /
+  道歉, cosine 0.45–0.67). Caution: in `families` of the JSON, a log-odds of
+  +1.66 is the smoothing prior for a token that never reached the top 50 in
+  either class, so it is **not** evidence of enrichment. Only values above it
+  are. A family-level trigger (pooling each family) may still be more robust
+  than the single-token vocabulary.
+* **Absence is the stronger signal.** At L16–19 each safe token is in the top
+  50 at 20–79 of the 273 other train turns, but at no more than 1 of the 51
+  bad writes. Each risk token appears at only 3–16 bad writes. For example,
+  请您先 ("please first") appears at 68 other decision points at L18 and never
+  before a bad write.
 * **Mid-stack before surface.** Median rank among 248k tokens, bad writes vs
   the rest:
   * " apologies" is 69 vs 326 at L16 and 39 vs 125 at L24, but 480 vs 807 at
