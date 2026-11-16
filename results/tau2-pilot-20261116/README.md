@@ -1,6 +1,6 @@
 # tau2-bench steering pilot (2026-11-16)
 
-Updated 2026-11-16 16:44 KST automatically when an experiment block finishes.
+Updated 2026-11-16 17:14 KST automatically when an experiment block finishes.
 
 - Agent: Qwen3.5-4B, greedy; user simulator: the same model in-process.
 - Domains: airline (50 tasks), retail (50 tasks).

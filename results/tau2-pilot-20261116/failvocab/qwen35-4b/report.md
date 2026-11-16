@@ -1,6 +1,6 @@
 # Failure vocabulary (qwen35-4b), top-10
 
-episodes 72 (fail 26, pass 46); tasks 24; failure types communicate 7, db_mismatch 20, missing_write 14, unexpected_transfer 6, unexpected_write 6, wrong_args 9
+episodes 72 (fail 26, pass 46, provisional pass 0 = NL judge deferred, left out of outcome contrasts; NL-deferred episodes 0); tasks 24; failure types communicate 7, db_mismatch 20, missing_write 14, unexpected_transfer 6, unexpected_write 6, wrong_args 9
 turns {'read': 413, 'no_call': 465, 'bad_write': 67, 'good_write': 47}
 
 ## jlens / agent / fail_vs_pass  token(strata agreeing/mixed strata, within-stratum rate diff x100); only tokens whose sign agrees in >= 75% of the mixed strata, ranked by the diff
