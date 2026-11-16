@@ -1,6 +1,6 @@
 # tau2-bench steering pilot, Qwen3.5-9B user simulator (2026-11-16)
 
-Updated 2026-11-17 06:45 KST automatically when an experiment block finishes.
+Updated 2026-11-17 07:16 KST automatically when an experiment block finishes.
 
 - Agent: Qwen3.5-4B, greedy; user simulator: Qwen3.5-9B (greedy; sampled at T=0.7 for fitx) served from one GPU.
   The earlier run with a Qwen3.5-4B user simulator is in results/tau2-pilot-20261116.
