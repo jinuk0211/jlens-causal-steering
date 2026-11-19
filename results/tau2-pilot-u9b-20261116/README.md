@@ -1,11 +1,11 @@
 # tau2-bench steering pilot, Qwen3.5-9B user simulator (2026-11-16)
 
-Updated 2026-11-19 04:58 KST automatically when an experiment block finishes.
+Updated 2026-11-19 15:01 KST automatically when an experiment block finishes.
 
 - Agent: Qwen3.5-4B, greedy; user simulator: Qwen3.5-9B (greedy; sampled at T=0.7 for fitx) served from one GPU.
   The earlier run with a Qwen3.5-4B user simulator is in results/tau2-pilot-20261116.
 - Retail rewards with NL assertions are DB-only for now (NL assertions graded offline later).
-- Domains: airline (50 tasks), retail (50 tasks).
+- Domains: airline (50 tasks), retail (50 of 114 tasks in the steering runs; all 114 in the unsteered run), telecom (114 base tasks, unsteered run; characters not allowed in Windows file names are replaced by _ in task folder names).
 - Conditions: detect (unsteered, trigger only), fitx (extra unsteered train episodes),
   steered conditions (J-lens and the CAA / SADI / ITI / AUSteer baselines) as listed in queue.txt.
 - Code: branch agent/official-baselines-tau2 (843b76e).
