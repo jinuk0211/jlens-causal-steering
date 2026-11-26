@@ -50,9 +50,17 @@ def _cmd(pid):
 
 
 def is_ours(pid):
-    """Ours: the command line contains /LJW/agentbench2/, or it is the EngineCore of our vLLM server (port 18230)."""
+    """Ours: the command line contains /LJW/agentbench2/, or a python process whose working directory is under
+    /LJW/agentbench2/ (scripts started with a relative path; another user's cwd is unreadable), or the EngineCore of our
+    vLLM server (port 18230)."""
     c = _cmd(pid)
     if "/LJW/agentbench2/" in c:
+        return True
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = ""
+    if "/LJW/agentbench2/" in cwd + "/" and "python" in c:
         return True
     if c.strip().startswith("VLLM::EngineCore"):
         try:
@@ -214,7 +222,7 @@ class Edit:
 
 class Hooked:
     """Per-row edits. self.row_edits[r] = {(kind, layer): Edit}; self.row_on[r] = bool for the current forward.
-    kind is attn | mlp | down | res | oproj (input of self_attn.o_proj, full-attention layers only) | pln (output of
+    kind is attn | mlp | down | res | oproj (input of self_attn.o_proj, or of linear_attn.out_proj on linear layers) | pln (output of
     post_attention_layernorm). Capture: self.cap = {"mode": "mean"|"pos", "pos": [...], "kinds": set} or None."""
 
     def __init__(self, model):
@@ -231,6 +239,8 @@ class Hooked:
             b.post_attention_layernorm.register_forward_hook(self._out("pln", i))
             if hasattr(b, "self_attn"):
                 b.self_attn.o_proj.register_forward_pre_hook(self._pre("oproj", i))
+            else:
+                b.linear_attn.out_proj.register_forward_pre_hook(self._pre("oproj", i))
 
     def set_rows(self, row_edits, row_on=None):
         row_on = row_on if row_on is not None else [True] * len(row_edits)

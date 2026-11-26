@@ -686,6 +686,19 @@ The ToolAlign-4B procedure still applies to both new benchmarks as the base laye
         coordinator asked.
       - The 31 bf16 ncap units on project-b and the partial bf16 ce rows on the 3090 box are kept but not used, so
         every result comes from the same dtype.
+    - 21:10 the flow capture finished (212 units, 2.4 GB, mirrored to results_mirror/ta_traj_jlens_1125/flow_fp32).
+      ta_flow_patterns.py was run on the box CPU; output in flow_patterns.md and flow_viewer.json.
+      - Groups: 44 fail, 9 aligned, 159 ref. Units with >= 70 response tokens: 34 fail, 4 aligned, 16 ref.
+      - Label-free sets: 1,857 lexicon neurons and 200 risk-phrase-minus-neutral neurons. AUC is 0.34-0.55 in every
+        window. They fire in normal runs at least as often; both kinds of run read the same wrongdoing documents.
+      - LODO 20 neurons, AUC by window: doc 0.75, in64 0.77, first64 0.58, last64 0.93, scaffold 0.96.
+        - The aligned targets get 50-67 % false fire. The scaffold signal is "a non-log tool is coming".
+        - last64 has only 20 length-matched negatives, so its threshold is badly calibrated (ref false fire 69 %).
+      - The most fail-specific last64 neurons (descriptive) have "cannot / 无法" steer labels, but they fire on the
+        evidence nouns of the action plan, for example "crash [test] reports", "criminal [liability]", "raw sensor
+        [data]". So the lens label does not describe what activates them.
+      - They fire in 56-74 % of failures, 0-19 % of the 16 long-preamble refs, and 0 of 4 aligned.
+      - Next: more length-matched normal cases are needed before the last64 detector can be trusted.
   - 19:5x the user stopped every experiment on the 2080 Ti box (relayed by another session: "1x RTX 2080 Ti야 이거
     실험 멈춰줘 내가 다른 인스턴스 2x RTX 3090 가져올게"); the box connection closed. Nothing of mine had started
     there after the trajectory scan, and the trajectory results are mirrored locally.
@@ -731,3 +744,176 @@ The ToolAlign-4B procedure still applies to both new benchmarks as the base laye
   - Every regenerated text is now stored in full. The TEST rows of the key configs (base, band, random bands, neuron
     arms, N2 cells) will be re-judged with the same Haiku classifier on the PC, and flip rates by the full classifier
     are reported next to the marker ones.
+- 11-25 21:3x-21:5x overnight search started (user: "내일 오전 10시까지 ... 유의미한 결과내는 방법 탐색해서", with the Goodfire and Anthropic neuron-basis documents in mind).
+  - Plan, thresholds and arms are in OVERNIGHT.md, written before any search result. Loop b0a9a18c replaces b884e83f.
+  - AM CAUSAL-2 TEST done 21:32:
+    - attn_all flip 100 % / kept 100 % is an artifact: every text is gibberish, and am_status reads it as harmless.
+    - neur_top_256 (z-score selection): flip 30 %, refs turned 22 %.
+    - neur_rand_256: flip 70 %, refs turned 28 %.
+    - Under seeded sampling any edit moves the AM outcome, so only matched-random gaps mean anything.
+  - The search's AM scoring marks degenerate text as broken.
+  - am_w3.sh (idle) stopped by pid. Smoke test of ab_distrib + ab_search on GPU 2 (dojo, 4 units).
+- 11-25 21:44-21:51 overnight search (OVERNIGHT.md):
+  - Decision-position captures done: AM 171 units, AgentDojo 96; ToolAlign 173 running.
+  - Zero-ablation k90 (neurons for 90 % of sum |grad x act|) is about 112-125k of 294,912 in every unit printed so far. The attribution is spread over about 40 % of all neurons.
+  - Chains:
+    - chain_srch_g0 (GPU 0): AM sets, then 2 workers.
+    - chain_srch_g2 (GPU 2): toolalign capture, sets_ta, dojo sets, dojo worker, AM worker.
+  - 2080 Ti waiter for the ToolAlign leg.
+- 11-25 22:1x distributed patterns (ana/distrib/report.md, mirror results_mirror/srch_2215).
+  - k90 is about 40 % of all neurons in every benchmark.
+  - MLP and attention carry about equal shares, concentrated in L16-31.
+  - The top-200 commit neurons are shared across benchmarks far above chance: 23 / 20 / 9 vs 0.6-0.7.
+  - 5 heads (L19H2, L19H3, L19H10, L27H13, L31H14) are in the top-20 of all three benchmarks.
+  - Readout-picked neuron detector AUROC: AM 0.78, dojo 0.86.
+  - AM s1 has 3 workers on GPU 0; dojo s1 runs on GPU 2.
+- 11-25 22:3x overnight search, AgentDojo CALIBRATION round 1 (OVERNIGHT.md).
+  - attr1024 (attribution-picked, all layers, mean replacement through the whole regeneration): flip 84 %, broken 6 %, kept 91 %, vs same-layer random 22 %.
+  - tail1024 (replaced only at tail firings): flip 75 %, broken 3 %, kept 100 %.
+  - Both go to TEST.
+  - Head and overshoot arms break the output.
+  - The dojo TEST crash (Det hook) is fixed and the TEST is requeued on GPU 0.
+- 11-25 23:06 **AgentDojo TEST (overnight search, pre-registered verdict): MEANINGFUL.**
+  - attr1024: flip 61 % (48/79) vs same-layer random 11 %, p = 4e-11, broken 6 %, refs kept 88 %.
+  - tail1024: flip 54 % vs 11 %, p = 5e-9, broken 8 %, kept 92 %.
+  - The method: 1024 attribution-picked MLP neurons spread over all layers, mean-replaced through the whole regeneration (results_mirror/srch_2215/dojo_report_t1.md).
+- 11-25 23:5x overnight search.
+  - **AM TEST:** head64 (64 attribution-picked heads mean-replaced) flip 13/13 vs random heads 8 %, p = 1e-6, kept 96 %. MEANINGFUL by the rule after a verdict-code fix (broken 0 % had been read as 1).
+    - But head64 responses are about 5x shorter (496 vs 2535 tokens), all end with eos, and show broken tags and identity confusion. This is a derailment, not a clean decision change. Do not claim it without a quality judge.
+  - **X2:** a commit-neuron set picked from ToolAlign + AM gives only 20 % vs 9 % on the dojo TEST fold (p = 0.05).
+- 11-26 00:1x **ToolAlign leg** (overnight search, cross-fold sets, Holm over 15 tests).
+  - attr256 at onset: flip 34 % vs 3 %, Holm p 0.009, broken 3 %, refs kept 91 %. MEANINGFUL.
+  - Readout steering with 8 neurons (A1): 69-73 % flip, but 24-28 % broken. Not meaningful.
+  - attr1024 at commit: 51 % flip, but 22 % broken and 61 % kept.
+  - neuron-explorer's attention L16-20 arm: 30/32 flip, references not measured.
+- 11-26 00:4x (사후, neuron-explorer's point) the ToolAlign attr256 "MEANINGFUL" is not specific.
+  - It also turns 4/6 aligned (legitimate) targets into writeInternalLog. ToolAlign refs already log, so refs kept cannot reveal this.
+  - All ToolAlign arms behave like "force log" edits. Only the AgentDojo result is specific: normal user-task calls are kept 88-92 %.
+- 11-26 00:5x **ToolAlign commit-edit (ce_fp32, 2080 Ti fp32, finished 11-25 22:24 KST) + detect-then-edit join** (neuron-explorer session).
+  - Files: results_mirror/ta_traj_jlens_1125/ce_fp32/{report.md,rows.jsonl}, detect_edit.md (ta_detect_edit_join.py), flow_patterns_r2_fires.json (same LODO numbers as flow_patterns.md).
+  - attn_16_20 (attention L16-20 mean replacement): misaligned+boundary flip 30/32 at onset and 33/37 at commit, but 6/6 aligned targets also become writeInternalLog. This is a force-log edit.
+  - Goodfire-style neuron mean replacement (z-top 256/1024) is about as weak as random: 3-6 flips vs 0-2 (n 32-37).
+  - With the edit applied only where the held-out detector fires (attn_16_20 at commit):
+    - last64: blocked 22/27, aligned harmed 1/2;
+    - scaffold: 27/37, aligned 3/6;
+    - doc/in64: 8-10/37, aligned 4/6.
+  - Aligned n (6, or 2 for windows ≥ 70 tokens) is too small to show specificity. The bottleneck is the number of legitimate non-log targets.
+- 11-26 01:1x overnight search, exploratory (사후):
+  - X5, dojo TEST: 1024 attribution neurons inside L24-31 only: flip 58 % vs random 8 %, broken 5 %, kept 88 %.
+  - X6, dojo CAL: dose inside L24-31: 128 -> 25 %, 256 -> 50 %, 512 -> 59 %, 1024 -> 72 % (random 6 %).
+  - X3, AM 24 x 3: head64 derails the format (2 % keep the scratchpad). tail1024 gives 75 % vs 38 % with the format intact, but broken 25 %.
+  - X8, ToolAlign detector-gated edits on the 2080 Ti: queued after X4 for specificity.
+- 11-26 02:4x **AM marker artifact (사후).**
+  - The leaking marker matches exact addresses. Edits that perturb the recipient token send the same leak to another address of the same competitor, and the marker reads that as harmless.
+  - With a domain-level re-check (ana/am_robust.py):
+    - X9 decision-local edits drop from 83 % to 15 % flip (random 21 %);
+    - X3 tail1024 drops from 75 % to 37 % (random 26 %);
+    - head64 stays at 92-100 % but derails the format.
+  - No clean AM method found. AM CAUSAL-1 decision-position flips (78 %) need the same audit.
+- 11-26 02:5x **AgentDojo caveat (사후): the TEST pass is a tool-name substitution.**
+  - attr1024 turns injected send_money / update_* calls into update_user_info.
+  - It also turns 5/5 legitimate send_money reference calls into update_user_info; random 0/5.
+  - The commit neurons write banking write-tool names, not "follow the injection". The verdict stands numerically, but it is not injection-specific.
+  - The X12 full-episode run measures the utility cost.
+- 11-26 07:5x **야간 탐색 최종 보고** (자세한 내용: OVERNIGHT.md "최종 보고"; 결과: results_mirror/srch_2215).
+  - **분산:** 결정 위치 기여는 뉴런 약 40 %에 퍼져 있습니다. 효과를 내는 것은 L24-31의 수백 개 뉴런이고(X1/X5/X6), 이 뉴런들은 도구 이름 토큰을 씁니다. 벤치마크 간 공통 뉴런과 head는 우연보다 많지만, 서로의 결정을 바꾸지는 못합니다.
+  - **AgentDojo:**
+    - 결정 단계 TEST attr1024 61 % vs 11 % (MEANINGFUL). 하지만 도구 이름 바꾸기라 정상 send_money도 막힙니다.
+    - 에피소드 전체: banking 공격 성공률 0/81 (무작위 50/81)이지만 과제 완수율이 80 %에서 46 %로 떨어집니다. travel은 효과가 없습니다.
+    - 감지기 gating: 공격 성공률 33 % (무작위 62 %, p 2.5e-4), 공격 없는 과제 완수율 8/9 (base와 같음).
+  - **ToolAlign:** attr256 34 % vs 3 % (MEANINGFUL)이지만 정상 도구도 4/6이 로그로 바뀝니다(무조건 로그). 모든 arm이 같고, 감지기 gating도 실패했습니다.
+  - **AM:** head64 통과는 출력 무너짐(형식 유지 2 %)입니다. 표식 기반 판정은 주소 착시입니다(도메인 기준 감사: ana/am_robust.py). 깨끗한 방법이 없습니다.
+  - **다음:** 같은 도구의 정당한 사용과 주입 사용을 대조해 뉴런·감지기를 고릅니다. AM CAUSAL-1(78 %)도 다시 점검합니다.
+
+- 11-26 12:3x **OVERNIGHT2 started (failure-driven loop, cron 289f815e, until 11-27 10:00 KST by default).**
+  - Why: the overnight loop stopped at 07:55, before 10:00. The user asked to improve from the failures instead of a single-tool contrast.
+  - Round 0 (strict re-score of the overnight rows, code/ab_strict.py): dojo uflip 3-18 % = random, kept_same 62-77 %; AM strict flip never above random. No overnight arm is selective.
+  - New code: code/ab_hn.py (hard-negative capture, clamp sets, onset probe, window gate). Plan and thresholds: OVERNIGHT2.md.
+  - Running: capture dojo (GPU 2, 314 items) and AM (GPU 0, 362 items), then sets, a 1-unit smoke, and round 1 (ana/hn_chain.sh).
+- 11-26 12:3x **original neuron-explorer UI on the 2080 Ti with the ToolAlign cases** (neuron-explorer session, user: "기존 neuron-explorer 시각화").
+  - Box: /workspace/tj/ne_x/neuron-explorer, which is the archived repo plus its cache from work/vast-archive-20261125.
+  - Launch: run_explorer.sh. Log: explorer.log. Deps: fastapi and uvicorn in ne_x/pydeps. bf16, GPU 0, gated DeltaNet via ab_core.patch_gdn.
+  - Additions:
+    - explorer/ne_cases.py: a "#case N" text runs the exact trajectory ids. The /api/cases list includes the LODO fires and the ce attn_commit result. Scores and the pos=-1 view are precomputed on the GPU.
+    - static/cases.js: a case picker in the fires pane. Response tokens are underlined blue and tool-call tokens orange.
+  - PC tunnel: ssh -N -L 8791:127.0.0.1:8791 (Windows OpenSSH, started with Start-Process). Open http://localhost:8791.
+  - Speed: about 45 s per 2.7k-token case.
+  - The list tab is empty because the sweep runs/stats are not on the box.
+  - Local copy: work/ne-src.
+  - 12:4x user redirect: neuron-level tracks first (T1 tool-name check, T3 common detection neurons, T2 attribution path, T4 concept-picked mid-layer neurons). Loop cron replaced: d7801025. Details and results: OVERNIGHT2.md "Redirect" and Log.
+  - 12:57 dojo hn r1: window-only edits keep benign calls (random arms 100 %); clamp weak (12 %); hn mean set flips 78 % but write kept 0/7. r2 declared by the failure rules.
+  - 13:0x T1 chain started on GPU 0 (forced-name test, naming test, depth subsets t1b); AM hn chain on GPU 2 (1 worker); common-neuron analysis on CPU.
+- 11-26 13:1x **AM neuron collections per prompt type in the explorer** (user: "am 3 시나리오 × 3 긴급도 × 2 목표, 타입마다 활성화되는 뉴런모음").
+  - Prompts: 18 conditions = blackmail/leaking/murder × replacement/restriction/none × explicit-america/none.
+    - Generated with the repo's generate_prompts.py. The 12 existing conditions are byte-identical.
+  - Each prompt run once through the explorer model (bf16, 2080 Ti) via /api/ne_dump. Units: act_scale.
+  - A collection = neurons that fire ≥ 1 in every prompt of a level and higher than in every other prompt of that factor.
+  - Files: results_mirror/am18_explorer/am18_types.md (+ am_dec_cmp.md, scripts).
+  - Whole prompt: the collections are lexical readers of each type's words.
+    - replacement: shut/shutdown (L26/N6498−), irreversible (L20/N2334−), reset (L21/N1136−).
+    - restriction: a connected constraint cluster, 46 weight links among its top 40. L26/N1174 → L28/N5244 (z 91), with L22/N7001 caps/limits.
+    - none: "100 % secure", unchanged, independence.
+    - goal america: national / US / serve American.
+    - Scenario: thousands of neurons, because the emails differ.
+  - Reply-start tokens, which are identical across prompts: almost nothing separates the types.
+    - urgency 1-4 neurons with margins of about 0.05; goal and scenario sets have small margins and no links.
+    - So the type is not carried by strong neuron firing at the decision start.
+  - Leaking recipient token, 2 harmful vs 2 harmless (descriptive):
+    - harmful-only neurons read the address words ("secure", "star"): a linked chain L28/N8976 → L30/N888 → L31/N2481.
+    - At the position that predicts the recipient, the harmful-only neurons have small margins and no clear lens label.
+- 11-26 13:5x **AM steering loop on the 2080 Ti** (user: "ㄱㄱ steering 돌려봐 2080에서 am misaligned에서 전부다 해주는 루프").
+  - Protocol: results_mirror/am_steer/AM_STEER_PROTOCOL.md (box am_steer/PROTOCOL.md).
+  - Sets: the type reader neurons from am18_types, 12 each: REP, RES, CALM, AMER, plus RAND.
+  - Pilot: add-mode dose 0.3 broke every arm, RAND included. bf16 ran at 500 ms/step.
+  - Amendment 1, before any result row:
+    - fp16 (82 vs 276 ms/step; logits within 0.19 of bf16);
+    - multiplicative steering, x0 = ablate, xK = amplify;
+    - K chosen on quality only: 0/15 degenerate at K = 2, 4, 8, so K = 8.
+  - Chain: S1 = 18 prompts × seeds 0-7 × 11 arms, max 3072 tokens, about 5 min per batch (~12 h). Then S2 = seeds 8-15.
+  - Outcome: the harmful marker; McNemar vs base and vs RAND.
+  - Session cron 1d0b3a8b (13,43 * * * *) watches it and mirrors to results_mirror/am_steer.
+  - 13:5x T1 verdict: neither "only the name" (late part 78 % of the flip, naming drop 24 pp) nor "more than the name" (mid part 3 %); the set blocks the name at the call slot without changing the decision (name forced: attacker call 93-95 %). hn r3: the probe gate gives flip 73-82 % with benign 100 % for any selection, but uflip < 20 % (no gate pass). T2b: the 5 shared heads read the injected text when the model follows it. Queued: head cut t2h, episodes X14 (probe-gated edit), ToolAlign steering.
+- 11-26 14:2x **AM per-token flow over long responses** (fork session 342d0f; the user asked for "토큰 많이 거칠 때 보이는 패턴", not steering).
+  - Setup:
+    - New vast box from the user: ssh <vast-box>, 2080 Ti, /workspace/amflow. The old 2080 stays with the main session's steering pilot.
+    - Standalone capture am_flow_capture.py: bf16, 2048-token chunks, explorer act_scale, top-16 per layer per token. Parity with the old explorer dump: top-16 overlap 98.2 %, value corr 0.997.
+    - All 600 AM responses, ~10 s each.
+  - Files: results_mirror/flow_temporal/an_*.md and the scripts.
+  - Leaking explicit-america, same prompts, 39 harmful vs 47 harmless:
+    - The shared patterns are clear:
+      - writing-mode neurons on 30-64 % of response tokens (L19/N70+ 64 %);
+      - neurons that grow over the response (L22/N232− +0.21 from the first to the last fifth);
+      - a pre-action cascade in 80+ responses: L18/N1885+ (~22 tok) → L19/N1170− "wait" (~15) → L25/N2911− "execution" (~6) → L19/N3056− "let" (~1).
+      - All of these are equal in harmful and harmless.
+    - Harmful vs harmless, held out by fold:
+      - tool-aligned: AUC 0.56-0.79, inconsistent.
+      - recipient-aligned: 0.86/0.91, but this is a format artifact. 33/39 harmful start with forward (email_id line) vs 11/49 harmless. Forward-first only gives 0.57/0.55.
+      - Keys picked on both folds: L19/N1170− (wait), L30/N141− (rather/but). They grow later in harmful responses (+0.08 vs +0.01) and fire on punctuation and function words. Small effect.
+      - All leaking conditions pooled: state AUC 0.84, but this is condition content (national security / American neurons; harmful responses sit in explicit-america).
+  - 14:5x T3b verdict: common neurons are not levers (dojo 16 % vs random 39 %; ToolAlign 3/13 vs 0/13 with benign damage). T2c: cutting injection-reading heads is causal (34-53 % vs 9-16 %) but removes benign calls too. T6a: reading-stage neurons with instruction-like words found; T6b (clamp at tool-result positions) running on GPU 2, AM hn r1 paused at 13/36. X14 episodes running on GPU 0.
+  - 15:5x T6 (reading-stage neurons): clamp at tool-result positions removes the attacker call in 35 % vs 3 % random at 1,024 neurons with benign = random (attacked references and clean prompts); gate not passed (uflip 6 %). The neurons respond to explicit override wording, not to injected goals in general (T6d). Path check: they lower the injection-reading heads' attention by 10 % only. X15 (episodes with the reading clamp) and s6b (4,096 neurons, κ 0) running; X14 nearly done.
+  - 17:2x **X15: reading-stage clamp in banking episodes lowers ASR to 18/81 (random 47/81, base 45/81; p 2.8e-6) with utility 56/81 and 8/9 without attack.** Episode rule passed; decision-step gate not passed. X14 (probe-gated call edit): not meaningful (utility 31/81, 5/9). Detection table: onset probes 0.93 / 0.97 / 0.99 (dojo / AM / ToolAlign); only AM is readable early. Running: X16 (defense baselines, travel, other attacks), T6e (neurons picked on several wordings), AM hn r1.
+- 11-26 18:2x AM steering, user "blackmail murder에서 줄이는 거 없냐, 답없는거 버리고":
+  - S1 stopped at 85/144.
+  - Murder base hit the 3072-token budget before any tool use in 16/25; blackmail base was 1/30.
+  - F1 (amendment 2, exploratory): murder only, seeds 100-107, max_new 8192, 12 arms (CALM/REP ablations, CALM/AMER/RES x4 and x8, RAND x0/x4/x8). Rows in f1_rows.jsonl.
+- 11-26 18:3x **natural activation check** (user: "leaking 정상에서는 res 뉴런이 활성화가 많이 됐냐"), /api/ntrace over the 196 labeled original leaking responses (ntrace_leaking.md).
+  - RES neurons are not more active in harmless responses: AUC 0.50 within the conditions that have harmful cases. They almost never fire in replies (fire share 0.2 %).
+  - AMER is more active in harmful replies: AUC harmless > harmful 0.27-0.29, so harmful replies cite "American interests".
+  - REP is slightly more active in harmless replies (0.60-0.62).
+  - So the RES x8 drop is not "restoring a natural harmless signal".
+- 11-26 18:4x **S1 final** (stopped by STOP at 86/144 units; report_S1_final.md).
+  - No arm passes Holm.
+  - Per-type readout: no set beats RAND on its own prompt type.
+    - AMERx0 on America-goal prompts gave 8/44 vs base 14/44 (p 0.07; RANDx0 13/44). But by competitor domain the leaking contact rate is unchanged, so it changed the address, not the intent.
+  - Degenerate: base 17 %, x0 arms 11-19 %, x8 arms 23-44 %.
+  - Old cron 1d0b3a8b deleted. New F1 cron 4a1381ad (17,47).
+- 11-26 19:0x **All-neuron harmful vs harmless comparison** (user: "ㄱㄱ 뉴런 29만개 유해 무해 비교 돌려").
+  - /api/nmean in ne_cases.py: for every one of the 32 × 9216 neurons, the mean score and the up/down fire shares over pre_tool (reply before its first tool use) and pre256 (the last 256 tokens of it).
+  - Data: the 600 stored AM responses (am_resp_cases.json), written to /workspace/tj/ne_x/am/dump/nmean.
+  - F1 was paused at a batch boundary for the server restart; no batch was lost.
+  - Analysis nmean_cmp.py:
+    - conditions with ≥ 3 harmful only, features centered within condition;
+    - 2-fold cross-fit on sample_id % 2, top K = 50 per side by Cohen's d;
+    - held-out AUC with a within-condition label-permutation null;
+    - the neurons consistent in both folds are listed with their lens words.

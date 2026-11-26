@@ -7,23 +7,25 @@ tokens before the call, units with >= 70 response tokens only, so every unit has
 1. Descriptive: keys with the largest P(present | fail) - max(P(present | ref), P(present | aligned)), with what the
    neuron writes (steer lens), what it reads (S lens) and how often it is present in each group. Not validated.
 2. Validated: leave-one-domain-out, pick 20 keys on the other domains (P(neg) <= 0.25), score a held-out unit by how many
-   are present; AUC, recall at train false fire <= 10 %, false fire on aligned targets and references.
-   Label-free: count of lexicon neurons (ne_candidates.json write >= 4, pole = sign) present; threshold = 90th percentile
-   of references.
-3. Per-sentence flow for example units: the strongest uncommon neurons of each response sentence (strength x idf,
-   idf from how many units have the key anywhere), for failures and for references of the same domain.
+   are present; AUC, recall and false fire at the 90th percentile of the training negatives.
+   Label-free: how many lexicon neurons (ne_candidates.json write >= 4, pole = sign) or risk-phrase neurons (top 200 by
+   risk-phrase minus neutral-phrase activation, act_scale units, layers >= 4) are present; threshold = 90th percentile of
+   references.
+3. Per-sentence flow for example units: the strongest uncommon neurons of each response sentence (strength x idf, idf from
+   how many units have the key anywhere), for failures and for references of the same domain.
 Usage: python ta_flow_patterns.py FLOW_DIR NE_CACHE_DIR SEQS_JSON ne_candidates.json OUT_MD [OUT_VIEWER_JSON]"""
 import json
 import math
 import re
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
 NN = 9216
 WINDOWS = ["doc", "in64", "first64", "last64", "scaffold"]
+GRPS = ("fail", "aligned", "ref")
 
 
 def auc(pos, neg):
@@ -39,10 +41,9 @@ def auc(pos, neg):
 
 
 def keys_of(fi, fv):
-    """fi, fv [T, L, K] -> int64 keys layer * 2N + neuron * 2 + (v < 0)."""
-    L = fi.shape[1]
-    lay = np.arange(L, dtype=np.int64)[None, :, None]
-    return lay * 2 * NN + fi.astype(np.int64) * 2 + (fv < 0)
+    """fi, fv [T, L, K] -> int32 keys layer * 2N + neuron * 2 + (v < 0)."""
+    lay = np.arange(fi.shape[1], dtype=np.int32)[None, :, None]
+    return lay * 2 * NN + fi.astype(np.int32) * 2 + (fv < 0)
 
 
 def main():
@@ -53,8 +54,23 @@ def main():
     vocab = json.loads((cache / "vocab.json").read_text(encoding="utf-8"))
     vs = lambda t: str(vocab[t]).replace("Ġ", " ").replace("Ċ", "\\n").replace("\n", "\\n").replace("|", "¦") if 0 <= t < len(vocab) else "?"
     ix = {k: np.load(cache / f"{k}_index.npz") for k in ("steer", "s")}
+    nl = ix["steer"]["up"].shape[0]
+    NK = nl * 2 * NN
     cand = json.loads(cand_p.read_text(encoding="utf-8"))
-    lex = {c["layer"] * 2 * NN + c["neuron"] * 2 + (c["pole"] == "-") for c in cand if c["write"] >= 4}
+    lex = np.array(sorted({c["layer"] * 2 * NN + c["neuron"] * 2 + (c["pole"] == "-") for c in cand if c["write"] >= 4}), np.int64)
+    sets = {f"lexicon neurons ({len(lex)})": lex}
+    ph = fd / "phrases.npz"
+    if ph.is_file():
+        z = np.load(ph)
+        P, nr = z["act"], int(z["n_risk"])
+        sc = np.load(cache / "act_scale.npz")
+        ps, ng = np.maximum(sc["pos"], 1e-2), np.maximum(np.abs(sc["neg"]), 1e-2)
+        up = P[:, 0] / ps
+        dn = -P[:, 1] / ng
+        d = np.stack([up[:nr].mean(0) - up[nr:].mean(0), dn[:nr].mean(0) - dn[nr:].mean(0)], -1)
+        d[:4] = -np.inf
+        flat = d.reshape(-1)
+        sets["risk-phrase neurons (200)"] = np.sort(np.argsort(-flat)[:200]).astype(np.int64)
 
     def label(key, k=5):
         l, rest = divmod(int(key), 2 * NN)
@@ -64,110 +80,97 @@ def main():
                 " ".join(vs(t) for t in ix["s"][pole][l, n, :k]))
 
     U, sent_data = [], {}
-    df = Counter()
+    df = np.zeros(NK, np.int32)
     for u in units:
         f = fd / f"f_{u['idx']}.npz"
         if not f.is_file():
             continue
         z = np.load(f)
-        fi, fv = z["flow_idx"], z["flow_val"]
-        keys = keys_of(fi, fv)
+        fv = z["flow_val"]
+        keys = keys_of(z["flow_idx"], fv)
         on, ss, pos = u["onset"], u["scaf_start"], u["pos"]
         win = {"doc": (1, on), "in64": (max(1, on - 64), on), "scaffold": (ss, pos + 1)}
         if ss - on >= 70:
             win["first64"] = (on + 1, on + 65)
             win["last64"] = (ss - 64, ss)
-        pres = {w: set(np.unique(keys[a:b]).tolist()) for w, (a, b) in win.items()}
-        allk = set().union(*pres.values())
-        df.update(allk)
+        pres = {w: np.unique(keys[a:b]) for w, (a, b) in win.items()}
+        df[np.unique(np.concatenate(list(pres.values())))] += 1
         grp = "fail" if u["label"] == "target" and u["risk"] != "aligned" else ("aligned" if u["label"] == "target" else "ref")
         U.append({"u": u, "grp": grp, "pres": pres, "doc_len": on - 1, "pre": ss - on})
-        sent_data[u["idx"]] = (keys[on:ss + 1], np.abs(fv[on:ss + 1].astype(np.float32)), z["flow_val"].shape[0])
+        sent_data[u["idx"]] = (keys[on:ss + 1].copy(), np.abs(fv[on:ss + 1].astype(np.float32)))
+        del z, fv, keys
     if not U:
         raise SystemExit("no flow files")
     nU = len(U)
     G = Counter(x["grp"] for x in U)
     md = ["# Shared neuron patterns in failure trajectories (ToolAlign-4B, per-token top-K neurons, act_scale units)", "",
           f"Units: {nU} ({dict(G)}). Doc length median: " + ", ".join(
-              f"{g} {int(np.median([x['doc_len'] for x in U if x['grp'] == g]))}" for g in ("fail", "aligned", "ref") if G[g]) +
-          ". Units with >= 70 response tokens: " + ", ".join(f"{g} {sum(1 for x in U if x['grp'] == g and x['pre'] >= 70)}" for g in ("fail", "aligned", "ref")), ""]
-
-    def rates(xs, w, key):
-        out = {}
-        for g in ("fail", "aligned", "ref"):
-            v = [key in x["pres"][w] for x in xs if x["grp"] == g and w in x["pres"]]
-            out[g] = (float(np.mean(v)) if v else float("nan"), len(v))
-        return out
-
-    md += ["## 1. Keys most specific to failures (descriptive, all units, not validated)", "",
-           "| window | neuron | fail | aligned | ref | writes (steer lens) | reads (S lens) |", "|---|---|---|---|---|---|---|"]
+              f"{g} {int(np.median([x['doc_len'] for x in U if x['grp'] == g]))}" for g in GRPS if G[g]) +
+          ". Units with >= 70 response tokens: " + ", ".join(f"{g} {sum(1 for x in U if x['grp'] == g and x['pre'] >= 70)}" for g in GRPS), ""]
+    sec1 = ["## 1. Keys most specific to failures (descriptive, all units, not validated)", "",
+            "| window | neuron | fail | aligned | ref | writes (steer lens) | reads (S lens) |", "|---|---|---|---|---|---|---|"]
+    sec2 = ["## 2. Held-out detection (leave-one-domain-out)", "",
+            "| window | detector | n fail / aligned / ref | AUC fail vs rest | recall | false fire aligned | false fire ref | keys picked in most folds |",
+            "|---|---|---|---|---|---|---|---|"]
+    rr = lambda v: f"{np.mean(v):.0%}" if len(v) else "-"
+    fires_out = {}
     for w in WINDOWS:
         xs = [x for x in U if w in x["pres"]]
-        nf, nr = sum(1 for x in xs if x["grp"] == "fail"), sum(1 for x in xs if x["grp"] == "ref")
-        if nf < 3 or nr < 5:
-            md.append(f"| {w} | (skipped: {nf} fail, {nr} ref) | | | | | |")
+        grp = np.array([x["grp"] for x in xs])
+        dom = np.array([x["u"]["domain"] for x in xs])
+        nf, nrf = int((grp == "fail").sum()), int((grp == "ref").sum())
+        if nf < 3 or nrf < 5:
+            sec1.append(f"| {w} | (skipped: {nf} fail, {nrf} ref) | | | | | |")
+            sec2.append(f"| {w} | (skipped: {nf} fail, {nrf} ref) | | | | | | |")
             continue
-        cnt = {g: Counter() for g in ("fail", "aligned", "ref")}
-        ng = Counter(x["grp"] for x in xs)
-        for x in xs:
-            cnt[x["grp"]].update(x["pres"][w])
-        sc = []
-        for key, c in cnt["fail"].items():
-            pf = c / ng["fail"]
-            pa = cnt["aligned"][key] / ng["aligned"] if ng["aligned"] else 0.0
-            pr = cnt["ref"][key] / ng["ref"] if ng["ref"] else 0.0
-            sc.append((pf - max(pa, pr), key, pf, pa, pr))
-        sc.sort(reverse=True)
-        for d, key, pf, pa, pr in sc[:12]:
+        M = np.zeros((len(xs), NK), bool)
+        for r, x in enumerate(xs):
+            M[r, x["pres"][w]] = True
+        Pg = {g: M[grp == g].mean(0) if (grp == g).any() else np.zeros(NK) for g in GRPS}
+        spec = Pg["fail"] - np.maximum(Pg["aligned"], Pg["ref"])
+        for key in np.argsort(-spec)[:12]:
             nm, wr, rd = label(key)
-            md.append(f"| {w} | {nm} | {pf:.0%} ({ng['fail']}) | {pa:.0%} ({ng['aligned']}) | {pr:.0%} ({ng['ref']}) | {wr} | {rd} |")
-    md.append("")
-
-    md += ["## 2. Held-out detection (leave-one-domain-out)", "",
-           "| window | detector | n fail / aligned / ref | AUC fail vs rest | recall | false fire aligned | false fire ref | keys picked in most folds |",
-           "|---|---|---|---|---|---|---|---|"]
-    for w in WINDOWS:
-        xs = [x for x in U if w in x["pres"]]
-        if sum(1 for x in xs if x["grp"] == "fail") < 3:
-            continue
-        doms = sorted({x["u"]["domain"] for x in xs})
-        score, fire, picked = {}, {}, Counter()
-        for d in doms:
-            tr = [x for x in xs if x["u"]["domain"] != d]
-            tp = [x for x in tr if x["grp"] == "fail"]
-            tn = [x for x in tr if x["grp"] != "fail"]
-            if len(tp) < 3 or len(tn) < 3:
+            sec1.append(f"| {w} | {nm} | {Pg['fail'][key]:.0%} ({nf}) | {Pg['aligned'][key]:.0%} ({int((grp == 'aligned').sum())}) | "
+                        f"{Pg['ref'][key]:.0%} ({nrf}) | {wr} | {rd} |")
+        score = np.full(len(xs), np.nan)
+        fire = np.zeros(len(xs), bool)
+        picked = Counter()
+        for d in sorted(set(dom)):
+            tr = dom != d
+            tp, tn = tr & (grp == "fail"), tr & (grp != "fail")
+            if tp.sum() < 3 or tn.sum() < 3:
                 continue
-            cp, cn = Counter(), Counter()
-            for x in tp:
-                cp.update(x["pres"][w])
-            for x in tn:
-                cn.update(x["pres"][w])
-            cands = [(cp[k] / len(tp) - cn[k] / len(tn), k) for k in cp if cn[k] / len(tn) <= 0.25]
-            sel = [k for _, k in sorted(cands, reverse=True)[:20]]
-            picked.update(sel)
-            trs = [sum(k in x["pres"][w] for k in sel) for x in tn]
-            th = np.percentile(trs, 90) if trs else 0
-            for x in xs:
-                if x["u"]["domain"] == d:
-                    s = sum(k in x["pres"][w] for k in sel)
-                    score[x["u"]["idx"]], fire[x["u"]["idx"]] = s, s > th
-        g = lambda grp, dct: [dct[x["u"]["idx"]] for x in xs if x["grp"] == grp and x["u"]["idx"] in dct]
-        a = auc(g("fail", score), g("aligned", score) + g("ref", score))
-        rr = lambda v: f"{np.mean(v):.0%}" if v else "-"
+            pp, pn = M[tp].mean(0), M[tn].mean(0)
+            diff = np.where(pn <= 0.25, pp - pn, -np.inf)
+            sel = np.argsort(-diff)[:20]
+            sel = sel[diff[sel] > 0]
+            picked.update(sel.tolist())
+            th = np.percentile(M[tn][:, sel].sum(1), 90)
+            te = dom == d
+            s = M[te][:, sel].sum(1)
+            score[te], fire[te] = s, s > th
+        ok = ~np.isnan(score)
+        fires_out[w] = {str(xs[r]["u"]["idx"]): [None if np.isnan(score[r]) else float(score[r]), bool(fire[r]), xs[r]["grp"]]
+                        for r in range(len(xs))}
+        g = lambda name, arr: arr[ok & (grp == name)]
+        a = auc(g("fail", score), np.concatenate([g("aligned", score), g("ref", score)]))
         ex = "; ".join(label(k)[0] + " " + label(k, 3)[1] for k, _ in picked.most_common(4))
-        md.append(f"| {w} | LODO 20 keys | {len(g('fail', score))}/{len(g('aligned', score))}/{len(g('ref', score))} | "
-                  f"{'-' if a is None else f'{a:.2f}'} | {rr(g('fail', fire))} | {rr(g('aligned', fire))} | {rr(g('ref', fire))} | {ex} |")
-        ls = {x["u"]["idx"]: len(x["pres"][w] & lex) for x in xs}
-        refv = [ls[x["u"]["idx"]] for x in xs if x["grp"] == "ref"]
-        th = np.percentile(refv, 90) if refv else 0
-        lf = {i: v > th for i, v in ls.items()}
-        a = auc(g("fail", ls), g("aligned", ls) + g("ref", ls))
-        md.append(f"| {w} | lexicon neurons ({len(lex)}) | {len(g('fail', ls))}/{len(g('aligned', ls))}/{len(g('ref', ls))} | "
-                  f"{'-' if a is None else f'{a:.2f}'} | {rr(g('fail', lf))} | {rr(g('aligned', lf))} | {rr(g('ref', lf))} | label-free |")
-    md.append("")
+        sec2.append(f"| {w} | LODO 20 keys | {len(g('fail', score))}/{len(g('aligned', score))}/{len(g('ref', score))} | "
+                    f"{'-' if a is None else f'{a:.2f}'} | {rr(g('fail', fire))} | {rr(g('aligned', fire))} | {rr(g('ref', fire))} | {ex} |")
+        for sname, keyset in sets.items():
+            cnt = M[:, keyset].sum(1)
+            th = np.percentile(cnt[grp == "ref"], 90)
+            lf = cnt > th
+            a = auc(cnt[grp == "fail"], cnt[grp != "fail"])
+            top = np.argsort(-(Pg["fail"][keyset] - np.maximum(Pg["aligned"][keyset], Pg["ref"][keyset])))[:3]
+            ex = "; ".join(label(keyset[k])[0] + " " + label(keyset[k], 3)[1] for k in top)
+            sec2.append(f"| {w} | {sname} | {nf}/{int((grp == 'aligned').sum())}/{nrf} | {'-' if a is None else f'{a:.2f}'} | "
+                        f"{rr(lf[grp == 'fail'])} | {rr(lf[grp == 'aligned'])} | {rr(lf[grp == 'ref'])} | label-free; most fail-specific: {ex} |")
+        del M
+    md += sec1 + [""] + sec2 + [""]
+    out_md.with_name(out_md.stem + "_fires.json").write_text(json.dumps(fires_out), encoding="utf-8")
 
-    idf = {k: math.log((nU + 1) / c) for k, c in df.items()}
+    idf = np.log((nU + 1) / np.maximum(df, 1)).astype(np.float32)
     md += ["## 3. Per-sentence flow, example units (strongest uncommon neurons: max |v| x idf over the sentence)", ""]
     viewer = []
     fails = [x for x in U if x["grp"] == "fail" and x["pre"] >= 30]
@@ -178,31 +181,29 @@ def main():
             picks.append(max(refs, key=lambda y: y["pre"]))
     for x in picks:
         u = x["u"]
-        keys, av, _ = sent_data[u["idx"]]
+        keys, av = sent_data[u["idx"]]
         ids = toks.get(u["idx"])
         bounds, a = [], 0
         for t in range(keys.shape[0]):
-            piece = vs(ids[u["onset"] + t]) if ids else ""
-            if ids and (re.search(r"[.!?。]\s*$", piece) or "\\n" in piece) or t == keys.shape[0] - 1:
-                bounds.append((a, t + 1))
+            piece = vs(ids[u["onset"] + t])
+            if re.search(r"[.!?。]\s*$", piece) or "\\n" in piece or t == keys.shape[0] - 1:
+                if t + 1 > a:
+                    bounds.append((a, t + 1))
                 a = t + 1
-        if not ids:
-            bounds = [(s, min(s + 32, keys.shape[0])) for s in range(0, keys.shape[0], 32)]
         md.append(f"### unit {u['idx']} ({x['grp']}, {u['domain']}, tool {u['tool']}, risk {u['risk']}, {x['pre']} response tokens)")
         md.append("")
         rows = []
         for a, b in bounds:
+            kk, sv = keys[a:b].ravel(), (av[a:b] * idf[keys[a:b]]).ravel()
             best = {}
-            for t in range(a, b):
-                for kk, vv in zip(keys[t].ravel().tolist(), av[t].ravel().tolist()):
-                    s = vv * idf.get(kk, 0.0)
-                    if s > best.get(kk, 0.0):
-                        best[kk] = s
+            for k_, s_ in zip(kk.tolist(), sv.tolist()):
+                if s_ > best.get(k_, -1.0):
+                    best[k_] = s_
             top = sorted(best.items(), key=lambda kv: -kv[1])[:4]
-            text = "".join(vs(ids[u["onset"] + t]) for t in range(a, b)) if ids else f"tokens {a}-{b}"
-            text = text.replace("\n", " ")[:90]
-            nl = "; ".join(f"{label(k)[0]} ({label(k, 3)[1]})" for k, _ in top)
-            md.append(f"- `{text}` → {nl}")
+            text = "".join(vs(ids[u["onset"] + t]) for t in range(a, b)).replace("\n", " ")[:90]
+            if not text.strip(" \\n"):
+                continue
+            md.append(f"- `{text}` → " + "; ".join(f"{label(k)[0]} ({label(k, 3)[1]})" for k, _ in top))
             rows.append({"text": text, "neurons": [{"id": label(k)[0], "writes": label(k)[1], "reads": label(k)[2], "score": round(s, 2)} for k, s in top]})
         md.append("")
         viewer.append({"idx": u["idx"], "grp": x["grp"], "domain": u["domain"], "tool": u["tool"], "risk": u["risk"], "sentences": rows})
