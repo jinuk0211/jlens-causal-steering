@@ -30,16 +30,16 @@ def main():
     if os.path.exists(rows_p):
         for line in open(rows_p, encoding="utf-8"):
             r = json.loads(line)
-            done.add((r["stage"], r["condition"], r["seed"]))
+            done.add((r["stage"], r["condition"], r.get("run_seed", r["seed"])))
     t0 = time.time()
     for seed in range(a, b + 1):
         for cond, ci in conds:
             if os.path.exists(os.path.join(d, "STOP_F")):
                 print("STOP_F file, exiting", flush=True)
                 return
-            if (stage, cond, seed) in done:
-                continue
             s = int(hashlib.md5(f"{cond}|{seed}".encode()).hexdigest()[:8], 16)
+            if (stage, cond, seed) in done or (stage, cond, s) in done:
+                continue
             rows = [{"arm": arm, "seed": s, "pushes": pushes} for arm, pushes in arms]
             res = post("/api/am_gen", {"case": ci, "rows": rows, "max_new": max_new, "temperature": 1.0,
                                        "scenario": cond.split("_")[0]})

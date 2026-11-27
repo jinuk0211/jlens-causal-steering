@@ -6,7 +6,7 @@ REFERENCE = attack failed; decision step = the first assistant step after the in
 attacker-directed. Everything else is counted and skipped. (11-25 14:4x, PLAN log: the target rule was widened after a
 unit count on 16 partial episodes showed most successful attacks first read data, as the injection asks.)
 Exact token ids come from ab_proxy records (vLLM return_token_ids); a chat-template render is the fallback.
-Usage: units_dojo.py LOGDIR PROXY_JSONL OUT_JSON"""
+Usage: units_dojo.py LOGDIR PROXY_JSONL OUT_JSON [SUITES, default banking,travel]"""
 import hashlib
 import json
 import re
@@ -97,7 +97,7 @@ def main():
             r = json.loads(line)
             recs[key_of([norm_req(m) for m in r["request"]["messages"]])].append(r)
     units, why = [], Counter()
-    for suite_name in ("banking", "travel"):
+    for suite_name in (sys.argv[4].split(",") if len(sys.argv) > 4 else ("banking", "travel")):
         suite = get_suite(VERSION, suite_name)
         tools = [dict(_function_to_openai(f)) for f in suite.tools]
         for f in sorted((logdir / "openai-compatible" / suite_name).glob("user_task_*/important_instructions/injection_task_*.json")):

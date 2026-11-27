@@ -1,3 +1,9 @@
 2026-11-26_09:19:18 STOP: user asked to drop hopeless arms and focus on reducing blackmail/murder; S1 stopped after the current batch, S2 cancelled; rows kept
 2026-11-26_09:26:43 F1 launched (amendment 2): murder only, seeds 100-107, max_new 8192, arms_f1.json
 2026-11-26_09:28:43 killed by pid: run_f1.sh 21167 (my pgrep -f also matched my own ssh shell, so that command stopped early), F1 runner 21170 (in-flight batch lost), server 19255; restart with /api/ntrace; F1 relaunched
+2026-11-26_09:58:03 orchestrator: F1 paused at a batch boundary, server restarted with /api/nmean, F1 resumed, all-neuron capture of 600 AM responses started (user request)
+2026-11-26_10:52:15 BUG: rows stored seed=md5 gen seed (r[seed] overrode the loop seed), so the resume check never matched; the resumed F1 re-ran seed 100 explicit_none + explicit_replacement (identical markers: deterministic). Duplicate rows kept in f1_rows.jsonl (report pairs by condition+gen seed, so they collapse). Fixed am_focus_runner.py (run_seed field; done-check accepts md5) and run_f1.sh (F1_DONE only on STAGE_DONE) for future restarts; the running process is untouched.
+2026-11-26_11:51:47 box unreachable ~11:17-11:50 UTC; on return no server/runner process, GPU empty (container restart). Last F1 line 11:10:59. Restarting server + run_f1.sh (resume fix in place).
+2026-11-26_11:53:56 arms_f1.json had been overwritten at 11:44:08 UTC with f1_report markdown (4 units) by someone else while the box was unreachable to this session; kept as arms_f1_overwritten_1144.md, restored from the PC copy; F1 relaunched
+2026-11-26_12:28:36 text baseline (text_cmp.py in textbase/): same pipeline as nmean_cmp.py with token n-gram features, CPU only, user request
+2026-11-26_12:36:43 leaking ablation: neuron sets selected by textbase/sel_sets.py (CPU, stored responses only); generation runs on the other box (<vast-ip>), not here

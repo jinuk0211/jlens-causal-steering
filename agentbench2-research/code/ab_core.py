@@ -20,9 +20,11 @@ from pathlib import Path
 
 import torch
 
-MODEL, REV = "Qwen/Qwen3.5-4B", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
-LENS_REPO, LENS_REV = "neuronpedia/jacobian-lens", "a4114d7752d11eb546e6cf372213d7e75526d3a1"
-LENS_FILE = "qwen3.5-4b/jlens/Salesforce-wikitext/Qwen3.5-4B_jacobian_lens_n1000.pt"
+MODEL = os.environ.get("AB_MODEL", "Qwen/Qwen3.5-4B")
+REV = os.environ.get("AB_REV", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a")
+LENS_REPO = "neuronpedia/jacobian-lens"
+LENS_REV = os.environ.get("AB_LENS_REV", "a4114d7752d11eb546e6cf372213d7e75526d3a1")
+LENS_FILE = os.environ.get("AB_LENS_FILE", "qwen3.5-4b/jlens/Salesforce-wikitext/Qwen3.5-4B_jacobian_lens_n1000.pt")
 CALL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)</function>\s*</tool_call>", re.S)
 PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
 FUNC_RE = re.compile(r"<function=([^>\n]+)>")
@@ -68,7 +70,11 @@ def is_ours(pid):
         except OSError:
             return False
         pc = _cmd(ppid)
-        return "vllm serve" in pc and "--port 18230" in pc
+        try:
+            pcwd = os.readlink(f"/proc/{ppid}/cwd")
+        except OSError:
+            pcwd = ""
+        return ("vllm serve" in pc and "--port 18230" in pc) or "/LJW/agentbench2/" in pc or ("/LJW/agentbench2/" in pcwd + "/" and "python" in pc)
     return False
 
 
@@ -87,16 +93,17 @@ def gpu_guard():
         bad = [x for x in others if PROJECTB_GPUS[dev] in x[1] and not is_ours(x[0])]
         if bad:
             raise SystemExit(f"GPU guard: project-b GPU {dev} has other processes {bad}")
-    elif plat == "r3090":
+    elif plat in ("r3090", "a4000", "t2080"):
         dev = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if dev not in ("0", "1"):
-            raise SystemExit("GPU guard: r3090 needs CUDA_VISIBLE_DEVICES=0 or 1")
+        allowed = {"r3090": ("0", "1"), "a4000": ("0", "1", "2", "3"), "t2080": ("0",)}[plat]
+        if dev not in allowed:
+            raise SystemExit(f"GPU guard: {plat} needs CUDA_VISIBLE_DEVICES in {allowed}")
         u = subprocess.run(["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader", "-i", dev], capture_output=True, text=True).stdout.strip()
         bad = [x for x in others if x[1] == u]
         if bad and os.environ.get("AB_ALLOW_SHARED") != "1":
-            raise SystemExit(f"GPU guard: r3090 GPU {dev} already has processes {bad} (container pids are not visible)")
+            raise SystemExit(f"GPU guard: {plat} GPU {dev} already has processes {bad} (container pids are not visible)")
     else:
-        raise SystemExit("set AB_PLATFORM=vast, projectb or r3090")
+        raise SystemExit("set AB_PLATFORM=vast, projectb, r3090, a4000 or t2080")
 
 
 def vast_device_map(split=19):
@@ -142,7 +149,8 @@ def load():
     else:
         if os.environ["AB_PLATFORM"] == "projectb" and PROJECTB_GPUS[os.environ["CUDA_VISIBLE_DEVICES"]] not in str(torch.cuda.get_device_properties(0).uuid):
             raise SystemExit("wrong GPU")
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, revision=REV, dtype=torch.bfloat16).cuda()
+        dt = torch.float16 if os.environ["AB_PLATFORM"] == "t2080" else torch.bfloat16
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, revision=REV, dtype=dt).cuda()
     model.model.visual = None
     model.eval()
     for p in model.parameters():

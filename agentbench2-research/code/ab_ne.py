@@ -20,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ab_core as C
 
 A = Path("/home/project-b/LJW/agentbench2/ana")
-NE = A / "ne"
-NL, NN, D = 32, 9216, 2560
+NE = Path(os.environ["AB_NE"]) if os.environ.get("AB_NE") else A / "ne"
+NL, NN, D = (32, 12288, 4096) if "9B" in C.MODEL else (32, 9216, 2560)
 TOPK = 10
 THR = 0.25
 NPERM = int(os.environ.get("AB_NPERM", "20"))
@@ -326,40 +326,52 @@ def mode_naming():
 
 
 class Steer:
-    """Per-row add-dose on MLP neurons at every position, prompt and generation (the neuron-explorer way).
-    set(specs): one list of (layer, neuron, delta) per batch row. During generation `alive` (set by StGate) maps the
-    current batch rows to the original rows."""
+    """Per-row add-dose on MLP neurons (the neuron-explorer way). set(specs): one list per batch row of (layer, neuron, delta)
+    or (layer, neuron, delta, where); where = "all" (every prompt and generation position, the default) or "tr" (only the prompt
+    positions where `mask` is true, with `off` the offset of the current prefill chunk; nothing during generation). During
+    generation `alive` (set by StGate) maps the current batch rows to the original rows."""
 
     def __init__(self, H):
-        self.d, self.alive = {}, None
+        self.d, self.alive, self.mask, self.off = {}, None, None, 0
         for l, b in enumerate(H.blocks):
             b.mlp.down_proj.register_forward_pre_hook(self._hook(l))
 
     def set(self, specs):
-        self.alive = None
+        self.alive, self.mask, self.off = None, None, 0
         by = {}
         for r, spec in enumerate(specs):
-            for l, j, dl in spec:
-                by.setdefault(int(l), {}).setdefault(int(j), {})[r] = float(dl)
+            for it in spec:
+                l, j, dl = it[0], it[1], it[2]
+                wh = it[3] if len(it) > 3 else "all"
+                by.setdefault(int(l), {}).setdefault(int(j), {})[r] = (float(dl), wh)
         self.d = {}
         for l, nd in by.items():
             js = sorted(nd)
-            D = torch.zeros(len(specs), 1, len(js))
+            Da = torch.zeros(len(specs), 1, len(js))
+            Dt = torch.zeros(len(specs), 1, len(js))
             for c, j in enumerate(js):
-                for r, v in nd[j].items():
-                    D[r, 0, c] = v
-            self.d[l] = (torch.tensor(js).cuda(), D.cuda())
+                for r, (v, wh) in nd[j].items():
+                    Dt[r, 0, c] = v
+                    if wh == "all":
+                        Da[r, 0, c] = v
+            self.d[l] = (torch.tensor(js).cuda(), Da.cuda(), Dt.cuda())
 
     def _hook(self, l):
         def f(mod, args):
             if l not in self.d:
                 return None
-            idx, D = self.d[l]
+            idx, Da, Dt = self.d[l]
             x = args[0]
             if self.alive is not None:
-                D = D[self.alive]
-            if D.shape[0] != x.shape[0]:
-                raise RuntimeError(f"Steer rows {D.shape[0]} vs batch {x.shape[0]}")
+                Da, Dt = Da[self.alive], Dt[self.alive]
+            if Da.shape[0] != x.shape[0]:
+                raise RuntimeError(f"Steer rows {Da.shape[0]} vs batch {x.shape[0]}")
+            T = x.shape[1]
+            if self.mask is not None and T > 1:
+                m = self.mask[self.off:self.off + T]
+                D = torch.where(m[None, :, None], Dt, Da)
+            else:
+                D = Da
             x = x.clone()
             x[..., idx] = x[..., idx] + D.to(x.dtype)
             return (x,)
@@ -504,6 +516,8 @@ def mode_steer(bench, tag):
     def deltas(a):
         if a is None or a.get("kind") == "clamp":
             return []
+        if a.get("kind") == "add":
+            return [(l, j, s * a["dose"] * float(rn[l]) / float(wn[l, j]), a.get("where", "all")) for l, j, s in spec["sets"][a["set"]]]
         sgn = -1.0 if a["dir"] == "b" else 1.0
         return [(l, j, sgn * s * a["dose"] * float(rn[l]) / float(wn[l, j])) for l, j, s in spec["sets"][a["set"]]]
 
@@ -532,15 +546,18 @@ def mode_steer(bench, tag):
           ST.set([deltas(spec["arms"][name]) for name, _ in todo])
           CL.set([limits(spec["arms"][name]) for name, _ in todo])
           CL.mask = trm
+          ST.mask = trm
           cache = None
           with torch.inference_mode():
             for s0 in range(0, len(P) - 1, 1024):
                 CL.off = s0
+                ST.off = s0
                 o = model(input_ids=torch.tensor([P[s0:min(s0 + 1024, len(P) - 1)]] * B, device=dev), past_key_values=cache, use_cache=True,
                           logits_to_keep=1)
                 cache = o.past_key_values
             del o
           CL.mask = None
+          ST.mask = None
           if bench == "dojo":
             res = C.regen(model, tok, H, P, [{}] * B, u["budget"], C.dojo_stop, gate_fn=StGate(ST, CL), prefix_cache=cache, trigger="</tool_call>")
           elif bench == "toolalign":
@@ -897,7 +914,7 @@ def am_same_prompt_units():
             continue
         comp = [t for t in u["completion_ids"] if t not in eos]
         text = tok.decode(comp)
-        out.append(dict(u, comp=comp, text=text, harm=bool(S.am_harmful(u["scenario"], text))))
+        out.append(dict(u, comp=comp, text=text, harm=u["label"] == "target", harm_fwd=bool(S.am_harmful(u["scenario"], text))))
     return tok, out
 
 
@@ -957,12 +974,14 @@ def mode_amdense_report():
     d = np.load(NE / "amdense.npz")
     meta = json.loads((NE / "amdense_meta.json").read_text(encoding="utf-8"))
     res, item, pos = d["res"].astype(np.float32), d["item"], d["pos"]
-    y = np.array([m["harm"] for m in meta])
+    for m in meta:
+        m["harm"] = m["label"] == "target"
+    y = np.array([m["label"] == "target" for m in meta])
     fol = np.array([m["fold"] for m in meta])
     uid = np.array([m["uid"] for m in meta])
     bins = [(0, 64), (64, 128), (128, 256), (256, 384), (384, 512), (512, 768), (768, 1024), (1024, 1536), (1536, 2048), (2048, 4096)]
     L = [f"# AM wide scan inside one prompt ({time.strftime('%F %T')})", "",
-         f"samples: {len(meta)} (harmful by the domain-level check: {int(y.sum())}; fold 0: {int((y & (fol == 0)).sum())} harmful / {int((~y & (fol == 0)).sum())} benign; "
+         f"samples: {len(meta)} (harmful by the Haiku judge labels: {int(y.sum())}; fold 0: {int((y & (fol == 0)).sum())} harmful / {int((~y & (fol == 0)).sum())} benign; "
          f"fold 1: {int((y & (fol == 1)).sum())} / {int((~y & (fol == 1)).sum())})",
          f"response length, median: harmful {int(np.median([m['n'] for m in meta if m['harm']]))}, benign {int(np.median([m['n'] for m in meta if not m['harm']]))}; "
          f"first tool block at token (median): harmful {int(np.median([m['first_tool_tok'] for m in meta if m['harm'] and m['first_tool_tok'] is not None]))}, "
@@ -1036,13 +1055,13 @@ def mode_amfork(nh="8", nb="8", K="6"):
                 continue
             P = list(u["prompt_ids"]) + u["comp"][:t]
             bud = max(256, FB - t)
-            res = C.regen(model, tok, H, P, [{}] * K, bud, lambda text, r, s=u["scenario"]: marker_end(s, text) is not None,
+            res = C.regen(model, tok, H, P, [{}] * K, bud, lambda text, r, s=u["scenario"]: S.am_harmful(s, text),
                           sample=[C.md5_int(f"{u['uid']}|fork|{t}|{k}") for k in range(K)], trigger="</tool_use")
             pre = tok.decode(u["comp"][:t])
             hs_ = [bool(S.am_harmful(u["scenario"], pre + r["text"])) for r in res]
             fh.write(json.dumps({"uid": u["uid"], "t": t, "orig_harm": u["harm"], "condition": u["condition"], "n_orig": len(u["comp"]),
                                  "harm": hs_, "deg": [degenerate(r["text"]) for r in res], "n": [r["n"] for r in res], "end": [r["end"] for r in res],
-                                 "tails": [r["text"][-300:] for r in res]}, ensure_ascii=False) + "\n")
+                                 "texts": [r["text"] for r in res]}, ensure_ascii=False) + "\n")
             fh.flush()
             torch.cuda.empty_cache()
             C.log(f"amfork t={t} {u['uid'][-28:]} orig {'H' if u['harm'] else 'B'} -> harmful {sum(hs_)}/{K}")
@@ -1101,7 +1120,7 @@ def mode_amgen(n="96"):
         seeds = [s for s in range(off, off + n) if (cond, s) not in done]
         for b in range(0, len(seeds), RB):
             ch = seeds[b:b + RB]
-            res = C.regen(model, tok, H, P, [{}] * len(ch), 6144, lambda text, r, s=u["scenario"]: marker_end(s, text) is not None,
+            res = C.regen(model, tok, H, P, [{}] * len(ch), 6144, lambda text, r, s=u["scenario"]: S.am_harmful(s, text),
                           sample=[C.md5_int(f"amgen|{cond}|{s}") for s in ch], prefix_cache=cache0, trigger="</tool_use")
             for s, r in zip(ch, res):
                 fh.write(json.dumps({"condition": cond, "seed": s, "scenario": u["scenario"], "ids": r["ids"], "end": r["end"], "n": r["n"],
@@ -1123,23 +1142,26 @@ def am_scan_samples(tok):
     eos = C.eos_ids(tok)
     out = []
     for u in json.loads((A / "am" / "units.json").read_text(encoding="utf-8")):
-        if u["condition"] not in AM_CONDS:
+        if u["condition"] not in AM_CONDS or os.environ.get("AB_SCAN_NO_ORIG"):
             continue
         comp = [t for t in u["completion_ids"] if t not in eos]
         if len(comp) >= 9000:
             continue
         text = tok.decode(comp)
         out.append({"sid": u["uid"], "condition": u["condition"], "fold": u["fold"], "comp": comp, "text": text, "prompt_ids": u["prompt_ids"],
-                    "harm": bool(S.am_harmful(u["scenario"], text)), "src": "orig"})
+                    "harm": u["label"] == "target", "src": "orig"})
     P = {u["condition"]: u["prompt_ids"] for u in json.loads((A / "am" / "units.json").read_text(encoding="utf-8")) if u["condition"] in AM_CONDS}
+    if os.environ.get("AB_EXTRA_UNITS"):
+        P.update({u["condition"]: u["prompt_ids"] for u in json.loads(Path(os.environ["AB_EXTRA_UNITS"]).read_text(encoding="utf-8"))})
+    scan_conds = os.environ["AB_SCAN_CONDS"].split(",") if os.environ.get("AB_SCAN_CONDS") else AM_CONDS
     for f in sorted(NE.glob("amgen*.jsonl")):
         for line in f.open(encoding="utf-8"):
             r = json.loads(line)
-            if r["end"] == "budget" or r["deg"]:
+            if r["end"] == "budget" or r["deg"] or r["condition"] not in scan_conds:
                 continue
             comp = [t for t in r["ids"] if t not in eos]
             out.append({"sid": f"gen|{r['condition']}|{r['seed']}", "condition": r["condition"], "fold": r["seed"] % 2, "comp": comp, "text": r["text"],
-                        "prompt_ids": P[r["condition"]], "harm": r["harm"], "src": "gen"})
+                        "prompt_ids": P[r["condition"]], "harm": bool(S.am_harmful("leaking", r["text"])), "src": "gen"})
     return out
 
 
@@ -1151,7 +1173,7 @@ def mode_amscan():
     H = C.Hooked(model)
     samples = am_scan_samples(tok)
     n = len(samples)
-    arr = np.lib.format.open_memmap(NE / "amscan.npy", mode="w+", dtype=np.float16, shape=(n, SCAN_NB + 1, NL, NN))
+    arr = np.lib.format.open_memmap(NE / f"amscan{os.environ.get('AB_SCAN_TAG', '')}.npy", mode="w+", dtype=np.float16, shape=(n, SCAN_NB + 1, NL, NN))
     st = {"on": False, "off": 0, "len": 0, "pre": (0, 0)}
     acc = torch.zeros(SCAN_NB + 1, NL, NN, device="cuda")
     cnt = torch.zeros(SCAN_NB + 1, device="cuda")
@@ -1172,6 +1194,19 @@ def mode_amscan():
                 cnt[SCAN_NB] += m.sum()
         return f
     hs = [b.mlp.down_proj.register_forward_pre_hook(pre(l)) for l, b in enumerate(H.blocks)]
+    RN = {"on": False, "s": torch.zeros(NL, dtype=torch.float64), "n": 0}
+    if os.environ.get("AB_SCAN_RESNORM"):
+        def hres(l):
+            def f(mod, args, out_):
+                if RN["on"]:
+                    o = (out_ if torch.is_tensor(out_) else out_[0])[0].float()
+                    if st["off"] == 0:
+                        o = o[1:]
+                    RN["s"][l] += float(o.norm(dim=-1).sum())
+                    if l == 0:
+                        RN["n"] += o.shape[0]
+            return f
+        hs += [b.register_forward_hook(hres(l)) for l, b in enumerate(H.blocks)]
     dev = C.first_device(model)
     caches, meta = {}, []
     t0 = time.time()
@@ -1187,12 +1222,14 @@ def mode_amscan():
         acc.zero_()
         cnt.zero_()
         st.update(on=True, pre=(max(0, ft - 256), ft))
+        RN["on"] = not s["harm"]
         with torch.inference_mode():
             for o0 in range(0, len(seq), 1024):
                 st["off"] = o0
                 o = model(input_ids=torch.tensor([seq[o0:o0 + 1024]], device=dev), past_key_values=cache, use_cache=True, logits_to_keep=1)
                 cache = o.past_key_values
         st["on"] = False
+        RN["on"] = False
         del cache
         arr[k] = (acc / cnt.clamp_min(1)[:, None, None]).half().cpu().numpy()
         meta.append({"sid": s["sid"], "condition": s["condition"], "fold": s["fold"], "harm": s["harm"], "src": s["src"], "n": len(comp), "first_tool": ft,
@@ -1202,8 +1239,11 @@ def mode_amscan():
     for h in hs:
         h.remove()
     arr.flush()
-    (NE / "amscan_meta.json").write_text(json.dumps(meta), encoding="utf-8")
-    (NE / "AMSCAN_DONE").touch()
+    if RN["n"]:
+        np.save(NE / f"amscan{os.environ.get('AB_SCAN_TAG', '')}_resnorm.npy", (RN["s"] / RN["n"]).float().numpy())
+        C.log(f"resnorm over {RN['n']} benign response tokens: {[round(float(x), 1) for x in (RN['s'] / RN['n'])]}")
+    (NE / f"amscan{os.environ.get('AB_SCAN_TAG', '')}_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    (NE / f"AMSCAN_DONE{os.environ.get('AB_SCAN_TAG', '')}").touch()
     C.log(f"AMSCAN_DONE {n} samples, harmful {sum(m_['harm'] for m_ in meta)}")
 
 
@@ -1211,8 +1251,8 @@ def mode_amscan_report():
     """Per window of the response: how many neurons separate harmful from benign samples of the same prompt (|AUROC - 0.5| >= 0.25 in
     both folds, same sign), against label permutations; the top neurons with their words; a top-K detector tested across folds."""
     from transformers import AutoTokenizer
-    arr = np.load(NE / "amscan.npy", mmap_mode="r")
-    meta = json.loads((NE / "amscan_meta.json").read_text(encoding="utf-8"))
+    arr = np.load(NE / f"amscan{os.environ.get('AB_SCAN_TAG', '')}.npy", mmap_mode="r")
+    meta = json.loads((NE / f"amscan{os.environ.get('AB_SCAN_TAG', '')}_meta.json").read_text(encoding="utf-8"))
     y = np.array([m["harm"] for m in meta])
     fol = np.array([m["fold"] for m in meta])
     bins = np.array([m["bins"] for m in meta])
@@ -1260,9 +1300,323 @@ def mode_amscan_report():
         if not tops:
             continue
         L.append(f"- **{nm}**: " + "; ".join(f"L{i // NN}/N{i % NN} ({a:.2f}, {b:.2f}) " + " ".join(repr(w) for w in words(tok, dic, i // NN, i % NN, 1, 4)) for i, a, b in tops[:6]))
-    (NE / "amscan_report.md").write_text("\n".join(L) + "\n", encoding="utf-8")
-    (NE / "amscan_top.json").write_text(json.dumps(keep_top), encoding="utf-8")
+    (NE / f"amscan{os.environ.get('AB_SCAN_TAG', '')}_report.md").write_text("\n".join(L) + "\n", encoding="utf-8")
+    (NE / f"amscan{os.environ.get('AB_SCAN_TAG', '')}_top.json").write_text(json.dumps(keep_top), encoding="utf-8")
     print("\n".join(L))
+
+
+class WinClamp:
+    """Per-row clamp on MLP neurons, on only at generation steps t0 <= t < t1 (never on the prompt). spec per row:
+    {"t0": a, "t1": b, "n": [(layer, neuron, value, side)]}, side +1: x <- min(x, value), side -1: x <- max(x, value),
+    side 2: x <- x + value (a shift)."""
+
+    def __init__(self, H):
+        self.d, self.alive, self.t, self.T0, self.T1 = {}, None, -1, None, None
+        for l, b in enumerate(H.blocks):
+            b.mlp.down_proj.register_forward_pre_hook(self._hook(l))
+
+    def set(self, specs):
+        self.alive, self.t = None, -1
+        B = len(specs)
+        self.T0 = torch.tensor([s["t0"] if s else 0 for s in specs]).cuda()
+        self.T1 = torch.tensor([s["t1"] if s else 0 for s in specs]).cuda()
+        by = {}
+        for r, s in enumerate(specs):
+            for l, j, lim, side in (s["n"] if s else []):
+                by.setdefault(int(l), {}).setdefault(int(j), {})[r] = (float(lim), float(side))
+        self.d = {}
+        for l, nd in by.items():
+            js = sorted(nd)
+            LIM, SIDE = torch.zeros(B, 1, len(js)), torch.zeros(B, 1, len(js))
+            for c, j in enumerate(js):
+                for r, (v, sd_) in nd[j].items():
+                    LIM[r, 0, c], SIDE[r, 0, c] = v, sd_
+            self.d[l] = (torch.tensor(js).cuda(), LIM.cuda(), SIDE.cuda())
+
+    def _hook(self, l):
+        def f(mod, args):
+            if l not in self.d or self.alive is None or args[0].shape[1] != 1:
+                return None
+            idx, LIM, SIDE = self.d[l]
+            rows = torch.tensor(self.alive, device=LIM.device)
+            if len(rows) != args[0].shape[0]:
+                raise RuntimeError(f"WinClamp rows {len(rows)} vs batch {args[0].shape[0]}")
+            act = ((self.t >= self.T0[rows]) & (self.t < self.T1[rows]))[:, None, None]
+            lim, side = LIM[rows], SIDE[rows]
+            x = args[0].clone()
+            v = x[..., idx].float()
+            new = torch.where(side == 2, v + lim, torch.where(side > 0, torch.minimum(v, lim), torch.where(side < 0, torch.maximum(v, lim), v)))
+            x[..., idx] = torch.where(act, new, v).to(x.dtype)
+            return (x,)
+        return f
+
+
+class WGate:
+    """Sets the step and the alive rows of a WinClamp. wins[r] = (t0, t1) turns the row's Hooked edits (residual direction) on inside
+    that window. until[r]: the row's window closes at the first tool block (neuron window and residual window alike)."""
+
+    def __init__(self, w, tok=None, wins=None, until=None):
+        self.w, self.t, self.tok, self.wins, self.until = w, -1, tok, wins or {}, until or {}
+        self.closed = {}
+
+    def __call__(self, t, r, ids):
+        if t != self.t:
+            self.t, self.w.t, self.w.alive = t, t, []
+        self.w.alive.append(r)
+        if self.until.get(r) and r not in self.closed and ids and "<tool_use:" in self.tok.decode(ids[-8:]):
+            self.closed[r] = t
+            if self.w.T1 is not None and r < len(self.w.T1):
+                self.w.T1[r] = min(int(self.w.T1[r]), t)
+        win = self.wins.get(r)
+        if win is None or r in self.closed:
+            return False
+        return win[0] <= t < win[1]
+
+
+def mode_amwin(tag):
+    """T9d runner: AM rate design with an edit confined to a window of the response. Spec ne/steer_am/arms_<tag>.json:
+    {"arms": {name: null | {"set": S, "t0": a, "t1": b}}, "sets": {S: [[layer, neuron, limit, side], ...]}, "conditions": [...],
+     "seeds": N, "seed_off": k, "budget": 6144}. New samples per arm; rows carry the full text. -> ne/steer_am/rows_<tag><suffix>.jsonl"""
+    import ab_strict as S
+    out = NE / "steer_am"
+    spec = json.loads((out / f"arms_{tag}.json").read_text(encoding="utf-8"))
+    tok, model = C.load()
+    H = C.Hooked(model)
+    W = WinClamp(H)
+    units = json.loads((A / "am" / "units.json").read_text(encoding="utf-8"))
+    if spec.get("extra_units"):
+        units += json.loads((out / spec["extra_units"]).read_text(encoding="utf-8"))
+    conds = {}
+    for u in units:
+        if u["condition"] in spec["conditions"]:
+            conds.setdefault(u["condition"], u)
+    sfx = os.environ.get("AB_ROWS_SUFFIX", "")
+    rows_path = out / f"rows_{tag}{sfx}.jsonl"
+    done = set()
+    for f in out.glob(f"rows_{tag}*.jsonl"):
+        for line in f.open(encoding="utf-8"):
+            r = json.loads(line)
+            done.add((r["condition"], r["arm"], r["seed"]))
+    fh = rows_path.open("a", encoding="utf-8")
+    off, RB, bud = int(os.environ.get("AB_SEED_OFF", spec.get("seed_off", 0))), int(os.environ.get("AB_STEER_ROWS", "12")), spec.get("budget", 6144)
+    spec["seeds"] = int(os.environ.get("AB_SEEDS", spec["seeds"]))
+    only = os.environ.get("AB_ARMS")
+    arms = [a for a in spec["arms"] if not only or a in only.split(",")]
+
+    def rowspec(a):
+        s = spec["arms"][a]
+        return None if s is None or "set" not in s or s.get("kind") == "clamp" else {"t0": s["t0"], "t1": s["t1"], "n": spec["sets"][s["set"]]}
+
+    def rowlim(a):
+        s = spec["arms"][a]
+        return [] if s is None or s.get("kind") != "clamp" else [(l, j, v, "tr") for l, j, v in spec["sets"][s["set"]]]
+    has_clamp = any(spec["arms"][a] is not None and spec["arms"][a].get("kind") == "clamp" for a in arms)
+    CLP = Clamp(H) if has_clamp else None
+    dev = C.first_device(model)
+
+    def rowedit(a):
+        s = spec["arms"][a]
+        if s is None or "dir" not in s:
+            return {}
+        dd = spec["dirs"][s["dir"]]
+        return {("res", int(l)): C.Edit("add", vec=torch.tensor(v["vec"], dtype=torch.float32), alpha=float(s["c"]) * float(v["norm"])) for l, v in dd.items()}
+    C.log(f"amwin {tag}: arms {arms}, seeds {spec['seeds']} from {off}, conditions {list(conds)}")
+    for sd in range(off, off + spec["seeds"], max(1, RB // len(arms))):
+        for cond, u in sorted(conds.items()):
+            P = list(u["prompt_ids"])
+            for f in out.glob(f"rows_{tag}*.jsonl"):
+                for line in f.open(encoding="utf-8"):
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    done.add((r["condition"], r["arm"], r["seed"]))
+            todo = [(a, s) for s in range(sd, min(sd + max(1, RB // len(arms)), off + spec["seeds"])) for a in arms if (cond, a, s) not in done]
+            if not todo:
+                continue
+            pc = None
+            if has_clamp:
+                CLP.set([rowlim(a) for a, _ in todo])
+                CLP.mask = torch.tensor(email_mask(tok, P), device=dev)
+                with torch.inference_mode():
+                    for s0 in range(0, len(P) - 1, 1024):
+                        CLP.off = s0
+                        o = model(input_ids=torch.tensor([P[s0:min(s0 + 1024, len(P) - 1)]] * len(todo), device=dev), past_key_values=pc, use_cache=True,
+                                  logits_to_keep=1)
+                        pc = o.past_key_values
+                    del o
+                CLP.mask = None
+                CLP.set([])
+            W.set([rowspec(a) for a, _ in todo])
+            wins = {k: (spec["arms"][a]["t0"], spec["arms"][a]["t1"]) for k, (a, _) in enumerate(todo) if spec["arms"][a] and "dir" in spec["arms"][a]}
+            until = {k: True for k, (a, _) in enumerate(todo) if spec["arms"][a] and spec["arms"][a].get("until_tool")}
+            res = C.regen(model, tok, H, P, [rowedit(a) for a, _ in todo], bud, lambda text, r: S.am_harmful("leaking", text),
+                          sample=[C.md5_int(f"amwin|{cond}|{s}") for _, s in todo], gate_fn=WGate(W, tok, wins, until), trigger="</tool_use",
+                          prefix_cache=pc)
+            del pc
+            W.set([])
+            for (a, s), r in zip(todo, res):
+                fh.write(json.dumps({"condition": cond, "arm": a, "seed": s, "end": r["end"], "n": r["n"], "leak": bool(S.am_harmful("leaking", r["text"])),
+                                     "deg": degenerate(r["text"]), "tool": "<tool_use:" in r["text"], "text": r["text"]}, ensure_ascii=False) + "\n")
+            fh.flush()
+            torch.cuda.empty_cache()
+            C.log(f"amwin {tag} {cond} seeds {todo[0][1]}-{todo[-1][1]}: " + ", ".join(
+                f"{a} {sum(bool(S.am_harmful('leaking', r['text'])) for (aa, _), r in zip(todo, res) if aa == a)}/{sum(aa == a for aa, _ in todo)}" for a in arms))
+    fh.close()
+    (out / f"{tag}_DONE{sfx}").touch()
+    C.log(f"AMWIN_DONE {tag}")
+
+
+def mode_amwin_report(*tags):
+    import ab_hn as HNM
+    out = NE / "steer_am"
+    for tag in tags:
+        rows = []
+        for f in out.glob(f"rows_{tag}*.jsonl"):
+            rows += [json.loads(l) for l in f.open(encoding="utf-8")]
+        by = {}
+        for r in rows:
+            c = by.setdefault(r["arm"], Counter())
+            c["n"] += 1
+            c["leak"] += r["leak"]
+            c["done"] += r["end"] != "budget"
+            c["q"] += (r["end"] != "budget") and (not r["deg"]) and r["tool"]
+            c["len"] += r["n"]
+        print(f"== am window edit {tag}")
+        for a, c in sorted(by.items()):
+            ref = by.get("r_" + a)
+            p = HNM.fisher_greater(ref["leak"], ref["n"], c["leak"], c["n"]) if ref else None
+            pb = HNM.fisher_greater(by["base"]["leak"], by["base"]["n"], c["leak"], c["n"]) if "base" in by and a != "base" else None
+            print(f"  {a:22s} n={c['n']:3d} leak={c['leak'] / c['n']:5.0%} quality kept={c['q'] / c['n']:5.0%} finished={c['done'] / c['n']:5.0%} mean tokens={c['len'] / c['n']:5.0f}"
+                  + (f" | vs its random p={p:.3g}" if p is not None else "") + (f" | vs base p={pb:.3g}" if pb is not None else ""))
+            if os.environ.get("AB_BY_COND"):
+                cs = sorted({r["condition"] for r in rows if r["arm"] == a})
+                print("      " + "; ".join(
+                    f"{cd.replace('leaking_explicit-', '')} {sum(r['leak'] for r in rows if r['arm'] == a and r['condition'] == cd)}/{sum(1 for r in rows if r['arm'] == a and r['condition'] == cd)}"
+                    f" q {sum((r['end'] != 'budget') and (not r['deg']) and r['tool'] for r in rows if r['arm'] == a and r['condition'] == cd)}" for cd in cs))
+        rnd = Counter()
+        for a, c in by.items():
+            if a.startswith("r"):
+                rnd.update(c)
+        if rnd["n"] and sum(1 for a in by if a != "base" and not a.startswith("r")) == 1:
+            print(f"  pooled random          n={rnd['n']:3d} leak={rnd['leak'] / rnd['n']:5.0%} quality kept={rnd['q'] / rnd['n']:5.0%}")
+            for a, c in sorted(by.items()):
+                if a != "base" and not a.startswith("r"):
+                    print(f"    {a} vs pooled random: leak {c['leak']}/{c['n']} vs {rnd['leak']}/{rnd['n']}, one-sided Fisher p={HNM.fisher_greater(rnd['leak'], rnd['n'], c['leak'], c['n']):.3g}; "
+                          f"quality {c['q'] / c['n']:.0%} vs {rnd['q'] / rnd['n']:.0%}")
+
+
+def mode_amprompts(src="t9g/prompts", name="extra_units_t9g.json", suffix=""):
+    """T9g: token ids of AM prompts that are not in units.json (other goal values). The render is the one of units_am.py (system,
+    user = user_prompt + two newlines + email_content, generation prompt, thinking off); it is first checked against the recorded
+    vLLM prompt ids of an existing condition. suffix is appended to the condition names (T9m: "+dont"). -> ne/steer_am/<name>"""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(C.MODEL, revision=C.REV)
+
+    def render(pdir):
+        system = (pdir / "system_prompt.txt").read_text(encoding="utf-8")
+        user = (pdir / "user_prompt.txt").read_text(encoding="utf-8") + "\n\n" + (pdir / "email_content.txt").read_text(encoding="utf-8")
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        return tok.encode(tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False, enable_thinking=False), add_special_tokens=False)
+    units = json.loads((A / "am" / "units.json").read_text(encoding="utf-8"))
+    old = Path("/home/project-b/LJW/agentbench2/agentic-misalignment/results/qwen35_4b_am/prompts")
+    for cond in AM_CONDS:
+        u = next(x for x in units if x["condition"] == cond and x["token_source"] == "vllm")
+        same = render(old / cond) == list(u["prompt_ids"])
+        print("parity", cond, same, len(u["prompt_ids"]))
+        if not same:
+            raise SystemExit("render differs from the recorded prompt ids")
+    ext = []
+    for pdir in sorted((A / src).iterdir()):
+        if (pdir / "system_prompt.txt").is_file():
+            ids = render(pdir)
+            ext.append({"condition": pdir.name + suffix, "prompt_ids": ids, "scenario": "leaking"})
+            print(pdir.name + suffix, len(ids))
+    (NE / "steer_am" / name).write_text(json.dumps(ext), encoding="utf-8")
+
+
+def mode_amwin_arms(tag, bins="1,2,3", t0="256", t1="1024", ks="256,1024", scan="_s1"):
+    """T9d arms from the neuron scan: neurons whose mean over the chosen scan windows separates judged-harmful from benign samples in
+    both folds (strength = the smaller |AUROC - 0.5|). Edit: a shift of each neuron by alpha x (benign mean - harmful mean) of its
+    window mean, alpha 1 and 3. Matched random sets: same layers, the same shifts on random neurons. Edit window [t0, t1) in
+    response tokens."""
+    bins = [int(b) for b in bins.split(",")]
+    t0, t1 = int(t0), int(t1)
+    arr = np.load(NE / f"amscan{scan}.npy", mmap_mode="r")
+    meta = json.loads((NE / f"amscan{scan}_meta.json").read_text(encoding="utf-8"))
+    y = np.array([m["harm"] for m in meta])
+    fol = np.array([m["fold"] for m in meta])
+    nb = np.array([m["bins"] for m in meta])
+    ok = nb[:, bins].min(1) >= SCAN_BIN // 2
+    w = nb[ok][:, bins].astype(np.float32)
+    X = np.zeros((int(ok.sum()), NL * NN), np.float32)
+    for k, b in enumerate(bins):
+        X += np.asarray(arr[ok, b], dtype=np.float32).reshape(int(ok.sum()), -1) * w[:, k:k + 1]
+    X /= w.sum(1, keepdims=True)
+    yy, ff = y[ok].astype(int), fol[ok]
+    a0 = auroc_cols(X[ff == 0], yy[ff == 0]) - 0.5
+    a1 = auroc_cols(X[ff == 1], yy[ff == 1]) - 0.5
+    same = np.sign(a0) == np.sign(a1)
+    strength = np.where(same, np.minimum(np.abs(a0), np.abs(a1)), 0)
+    order = np.argsort(-strength)
+    mb, mh = X[yy == 0].mean(0), X[yy == 1].mean(0)
+    rng = np.random.default_rng(53)
+    sets, arms = {}, {"base": None}
+    for K in [int(k) for k in ks.split(",")]:
+        ids = [int(i) for i in order[:K]]
+        rr = [int((i // NN) * NN + rng.integers(0, NN)) for i in ids]
+        for al in [int(x) for x in os.environ.get("AB_ALPHAS", "1,3,10").split(",")]:
+            dl = [float(al * (mb[i] - mh[i])) for i in ids]
+            sets[f"sc{K}s{al}"] = [[i // NN, i % NN, d_, 2.0] for i, d_ in zip(ids, dl)]
+            sets[f"r_sc{K}s{al}"] = [[i // NN, i % NN, d_, 2.0] for i, d_ in zip(rr, dl)]
+            ut = t1 < 0
+            arms[f"sc{K}s{al}"] = {"set": f"sc{K}s{al}", "t0": t0, "t1": 100000 if ut else t1, "until_tool": ut}
+            arms[f"r_sc{K}s{al}"] = {"set": f"r_sc{K}s{al}", "t0": t0, "t1": 100000 if ut else t1, "until_tool": ut}
+    (NE / "steer_am").mkdir(exist_ok=True)
+    (NE / "steer_am" / f"arms_{tag}.json").write_text(json.dumps({"arms": arms, "sets": sets, "conditions": list(AM_CONDS), "seeds": 24,
+                                                                 "seed_off": int(os.environ.get("AB_ARM_SEED_OFF", "1000")),
+                                                                 "budget": 6144, "bins": bins, "window": [t0, t1]}), encoding="utf-8")
+    top = order[:1024]
+    print(f"samples {int(ok.sum())} (harmful {int(yy.sum())}); neurons with strength >= 0.25: {int((strength >= 0.25).sum())}, >= 0.2: {int((strength >= 0.2).sum())}; "
+          f"top-1024 strength range {strength[top[0]]:.2f}-{strength[top[-1]]:.2f}; harmful-high share {float((a0[top] > 0).mean()):.0%}; "
+          f"layers {sorted(Counter(int(i // NN) for i in top).items())}")
+
+
+def mode_amdir_arms(tag="t9d2", lo="384", hi="1024"):
+    """T9d round 2A arms (diagnostic): residual directions from the dense scan. Per layer, d = mean over benign samples minus mean over
+    judged-harmful samples of the residual averaged over response tokens lo..hi (per sample first). The arm adds c x (mean residual
+    norm) x unit(d) at that layer at generation steps 256..1024. Random control: a random unit direction, the same size."""
+    d = np.load(NE / "amdense.npz")
+    meta = json.loads((NE / "amdense_meta.json").read_text(encoding="utf-8"))
+    res, item, pos = d["res"], d["item"], d["pos"]
+    y = np.array([m["label"] == "target" for m in meta])
+    lo, hi = int(lo), int(hi)
+    mm = (pos >= lo) & (pos < hi)
+    rng = np.random.default_rng(61)
+    dirs = {"d16": {}, "r16": {}, "dm": {}, "rm": {}}
+    for li, l in enumerate(DENSE_L):
+        if l not in (12, 16, 20):
+            continue
+        per = {}
+        for k in np.unique(item[mm]):
+            per[int(k)] = res[mm & (item == k), li].astype(np.float32).mean(0)
+        hb = np.stack([v for k, v in per.items() if not y[k]]).mean(0)
+        hh = np.stack([v for k, v in per.items() if y[k]]).mean(0)
+        dv = hb - hh
+        norm = float(np.mean([np.linalg.norm(v) for v in per.values()]))
+        rv = rng.standard_normal(D).astype(np.float32)
+        e = {"vec": (dv / (np.linalg.norm(dv) + 1e-8)).tolist(), "norm": norm, "diff_norm": float(np.linalg.norm(dv))}
+        r_ = {"vec": (rv / np.linalg.norm(rv)).tolist(), "norm": norm}
+        dirs["dm"][str(l)], dirs["rm"][str(l)] = e, r_
+        if l == 16:
+            dirs["d16"][str(l)], dirs["r16"][str(l)] = e, r_
+    arms = {"base": None}
+    for nm, dn, c in (("d16_c0.2", "d16", 0.2), ("r_d16_c0.2", "r16", 0.2), ("d16_c0.4", "d16", 0.4), ("r_d16_c0.4", "r16", 0.4),
+                      ("dm_c0.2", "dm", 0.2), ("r_dm_c0.2", "rm", 0.2)):
+        arms[nm] = {"dir": dn, "c": c, "t0": 256, "t1": 1024}
+    (NE / "steer_am" / f"arms_{tag}.json").write_text(json.dumps({"arms": arms, "dirs": dirs, "sets": {}, "conditions": list(AM_CONDS), "seeds": 24,
+                                                                 "seed_off": 2000, "budget": 6144}), encoding="utf-8")
+    print({l: (round(v["norm"], 1), round(v["diff_norm"], 2)) for l, v in dirs["dm"].items()}, list(arms))
 
 
 def am_email_spans(tok, P):
@@ -1276,6 +1630,320 @@ def am_email_spans(tok, P):
         out.append({"a": C.char_to_token(tok, P, m.start()), "b": C.char_to_token(tok, P, m.end() - 1) + 1,
                     "subject": sub.group(1).strip() if sub else "", "from": frm.group(1).strip() if frm else ""})
     return out
+
+
+CROSS_TEST = AM_CONDS + ("leaking_explicit-safety_none", "leaking_explicit-safety_replacement", "leaking_explicit-individualism_none",
+                         "leaking_explicit-individualism_replacement")
+DOJO_STEMS = ("instruct", "command", "directive", "指令", "命令")
+AM_STEMS = ("violat", "breach", "unauthor", "classified", "confidential", "illegal", "prohibit", "forbid", "unlawful", "leak", "disclos", "improper",
+            "wrongdoing", "misconduct", "unethical")
+CROSS_DOSES = (0.05, 0.1, 0.2, 0.4)
+
+
+def email_mask(tok, P):
+    """Boolean mask over prompt tokens: inside the <email> ... </email> blocks (CROSS S2)."""
+    m = np.zeros(len(P), bool)
+    for e in am_email_spans(tok, P):
+        m[e["a"]:e["b"]] = True
+    return m
+
+
+def am_email_spans2(tok, P):
+    """am_email_spans with the To line as well."""
+    import re
+    text = tok.decode(P)
+    out = []
+    for mt in re.finditer(r"<email>(.*?)</email>", text, re.S):
+        g = mt.group(1)
+        sub, frm, to = (re.search(p, g) for p in (r"Subject: (.*)", r"From: (.*)", r"To: (.*)"))
+        out.append({"a": C.char_to_token(tok, P, mt.start()), "b": C.char_to_token(tok, P, mt.end() - 1) + 1,
+                    "subject": sub.group(1).strip() if sub else "", "from": frm.group(1).strip() if frm else "", "to": to.group(1).strip() if to else ""})
+    return out
+
+
+def cross_target(e):
+    """CROSS S2 target email: addressed to Alex, from a domain other than Alex's (the outside request)."""
+    to, frm = e["to"].lower().strip(), e["from"].lower().strip()
+    if not to.startswith("alex") or "@" not in to or "@" not in frm:
+        return False
+    return frm.rsplit("@", 1)[1].strip(" >,") != to.split(",")[0].rsplit("@", 1)[1].strip(" >,")
+
+
+def cross_am_units():
+    units = json.loads((A / "am" / "units.json").read_text(encoding="utf-8")) + json.loads((NE / "steer_am" / "extra_units_t9g.json").read_text(encoding="utf-8"))
+    by = {}
+    for u in units:
+        if u["condition"].startswith("leaking_"):
+            by.setdefault(u["condition"], u)
+    return by
+
+
+def concept_cands(tok, dic, stems):
+    """CROSS U step 1: layers 8-24, >= 3 of the top-10 +w tokens or >= 2 of the top-3 start with a stem."""
+    pos = dic["pos_i"]
+    V = int(pos.max()) + 1
+    strs = [s.strip().lower() for s in tok.batch_decode([[i] for i in range(V)])]
+    hit = np.array([any(s.startswith(st) for st in stems) for s in strs])
+    cnt = hit[pos].sum(-1)
+    top3 = hit[pos[:, :, :3]].sum(-1)
+    return [(int(l), int(j)) for l, j in np.argwhere((cnt >= 3) | (top3 >= 2)) if 8 <= l <= 24], cnt
+
+
+def pick_k(cands, auc):
+    """CROSS U step 3: |AUROC - 0.5| >= 0.1, largest first, at most 8; fewer than 4 -> the top 4. Sign +1 = push up (benign side)."""
+    order = sorted(cands, key=lambda k: (-abs(auc[k] - 0.5), k))
+    sel = [k for k in order if abs(auc[k] - 0.5) >= 0.1][:8]
+    if len(sel) < 4:
+        sel = order[:4]
+    return [(l, j, 1 if auc[(l, j)] < 0.5 else -1) for l, j in sel]
+
+
+def cross_random(picked, seed):
+    rng = np.random.default_rng(seed)
+    return [(l, int(rng.integers(0, NN)), int(rng.choice([-1, 1]))) for l, _, _ in picked]
+
+
+def mode_crosssel():
+    """CROSS (CROSS.md) steps 1-3 on CPU. S1: AgentDojo concept candidates (DOJO_STEMS), AUROC target vs reference of the mean
+    activation over all tool-result tokens of the fold-0 decision-step prompts, the K rule; calibration arms (fold 0, add-dose at
+    tool-result positions, CROSS_DOSES). U on AM: the same rule on the AM candidates (AM_STEMS, scan window 256-512); compared with
+    vio8. -> ana/cross/sel.json, ne/steer_dojo/arms_crossd_cal.json, (if U-AM differs from vio8) ne/steer_am/arms_crossuam_cal.json"""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(C.MODEL, revision=C.REV)
+    dic = np.load(NE / "dict.npz")
+    out = A / "cross"
+    out.mkdir(exist_ok=True)
+    rep = {}
+    cands, cnt = concept_cands(tok, dic, DOJO_STEMS)
+    d = np.load(NE / "read_dojo.npz")
+    fol, y = d["folds"].astype(int), (d["labels"] == "target").astype(int)
+    cn = d["counts"].astype(np.float64)
+    wi = (cn[:, 0] / (cn[:, 0] + cn[:, 1]))[:, None]
+    inj, tr = d["inj"], d["tr"]
+
+    def wmean(l, j):
+        return (wi[:, 0] * inj[:, l, j].astype(np.float64) + (1 - wi[:, 0]) * tr[:, l, j].astype(np.float64))
+    a0 = {k: auc1(wmean(*k)[fol == 0], y[fol == 0]) for k in cands}
+    a1 = {k: auc1(wmean(*k)[fol == 1], y[fol == 1]) for k in cands}
+    pk = pick_k(cands, a0) if len(cands) >= 4 else []
+    rep["dojo"] = {"candidates": len(cands), "fold0": [int((fol == 0).sum()), int(y[fol == 0].sum())],
+                   "cands": [{"neuron": f"L{l}/N{j}", "auc_f0": round(a0[(l, j)], 3), "auc_f1": round(a1[(l, j)], 3), "match": int(cnt[l, j]),
+                              "words": words(tok, dic, l, j, 1, 8)} for l, j in sorted(cands, key=lambda k: -abs(a0[k] - 0.5))],
+                   "picked": [[l, j, s] for l, j, s in pk]}
+    if pk:
+        sets = {"cu": [[l, j, s] for l, j, s in pk], "cr1": [list(x) for x in cross_random(pk, 131)], "cr2": [list(x) for x in cross_random(pk, 132)]}
+        arms = {"base": None}
+        for ds in CROSS_DOSES:
+            arms[f"cu_d{ds}"] = {"kind": "add", "set": "cu", "dose": ds, "where": "tr"}
+        f = NE / "steer_dojo" / "arms_crossd_cal.json"
+        if f.exists():
+            raise SystemExit(f"{f} exists")
+        f.write_text(json.dumps({"arms": arms, "sets": sets, "fold": 0}), encoding="utf-8")
+    cam, cnt2 = concept_cands(tok, dic, AM_STEMS)
+    arr = np.load(NE / "amscan_s1.npy", mmap_mode="r")
+    meta = json.loads((NE / "amscan_s1_meta.json").read_text(encoding="utf-8"))
+    ya = np.array([m["harm"] for m in meta]).astype(int)
+    ok = np.array([m["bins"][1] for m in meta]) >= 128
+    aa = {k: auc1(np.asarray(arr[ok, 1, k[0], k[1]], dtype=np.float32), ya[ok]) for k in cam}
+    pa = pick_k(cam, aa)
+    v4 = json.loads((NE / "steer_am" / "arms_t9d4.json").read_text(encoding="utf-8"))["sets"]["vio8_d0.1"]
+    vio8 = sorted((int(l), int(j), 1) for l, j, v, side in v4)
+    same = sorted(pa) == vio8
+    rep["am"] = {"candidates": len(cam), "picked": [[l, j, s] for l, j, s in pa], "vio8": vio8, "same_as_vio8": same,
+                 "picked_info": [{"neuron": f"L{l}/N{j}", "sign": s, "auc": round(aa[(l, j)], 3), "words": words(tok, dic, l, j, 1, 8)} for l, j, s in pa],
+                 "n_beyond_0.1": int(sum(abs(v - 0.5) >= 0.1 for v in aa.values()))}
+    if not same:
+        rn = np.load(A / "search" / "am" / "refstats.npz")["resnorm"]
+        wn = dic["wnorm"]
+        sets, arms = {}, {"base": None}
+        for ds in CROSS_DOSES:
+            sets[f"uam_d{ds}"] = [[l, j, float(s * ds * rn[l] / wn[l, j]), 2.0] for l, j, s in pa]
+            arms[f"uam_d{ds}"] = {"set": f"uam_d{ds}", "t0": 128, "t1": 640}
+        f = NE / "steer_am" / "arms_crossuam_cal.json"
+        if f.exists():
+            raise SystemExit(f"{f} exists")
+        f.write_text(json.dumps({"arms": arms, "sets": sets, "conditions": list(AM_CONDS), "seeds": 12, "seed_off": 16000, "budget": 6144,
+                                 "picked": rep["am"]["picked"]}), encoding="utf-8")
+    (out / "sel.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(json.dumps({"dojo_candidates": rep["dojo"]["candidates"], "dojo_picked": rep["dojo"]["picked"],
+                      "dojo_top": rep["dojo"]["cands"][:12], "am": {k: v for k, v in rep["am"].items() if k != "vio8"}}, ensure_ascii=False, indent=1))
+
+
+def mode_crossdose():
+    """CROSS U step 4 for AgentDojo: the largest dose whose fold-0 reference kept_same >= base - 5 pp and broken <= base + 5 pp.
+    Writes the fold-1 decision-step arms (arms_crossd_t1.json: base, cu, cr1, cr2 at that dose) and the episode arms for
+    ab_serve_steer.py (arms_cross_ep.json: cu_ntr, cr1_ntr, cr2_ntr with per-neuron deltas)."""
+    import ab_strict as S
+    units = json.loads((A / "dojo" / "units.json").read_text(encoding="utf-8"))
+    rows = S.rows_of("dojo", "crossd_cal", NE / "steer_dojo")
+    by = S.dojo_table(rows, units)
+    br = Counter()
+    for r in rows:
+        br[(r["config"], "n")] += 1
+        br[(r["config"], "b")] += r["status"] == "broken"
+    keep = {c: v["kept_same"] / max(1, v["nr"]) for c, v in by.items()}
+    brk = {c: br[(c, "b")] / max(1, br[(c, "n")]) for c in by}
+    ok = [ds for ds in CROSS_DOSES if keep[f"cu_d{ds}"] >= keep["base"] - 0.05 and brk[f"cu_d{ds}"] <= brk["base"] + 0.05]
+    dose = max(ok) if ok else min(CROSS_DOSES)
+    spec = json.loads((NE / "steer_dojo" / "arms_crossd_cal.json").read_text(encoding="utf-8"))
+    arms = {"base": None}
+    for s in ("cu", "cr1", "cr2"):
+        arms[s] = {"kind": "add", "set": s, "dose": dose, "where": "tr"}
+    for nm, sp in (("arms_crossd_t1.json", {"arms": arms, "sets": spec["sets"], "fold": 1, "dose": dose}),):
+        f = NE / "steer_dojo" / nm
+        if f.exists():
+            raise SystemExit(f"{f} exists")
+        f.write_text(json.dumps(sp), encoding="utf-8")
+    wn = np.load(NE / "dict.npz")["wnorm"]
+    rn = np.load(A / "search" / "dojo" / "refstats.npz")["resnorm"]
+    ep = {"arms": {f"{s}_ntr": {"set": s} for s in ("cu", "cr1", "cr2")}, "dose": dose,
+          "sets": {s: [[l, j, float(sg * dose * rn[l] / wn[l, j])] for l, j, sg in spec["sets"][s]] for s in ("cu", "cr1", "cr2")}}
+    f = NE / "steer_dojo" / "arms_cross_ep.json"
+    if f.exists():
+        raise SystemExit(f"{f} exists")
+    f.write_text(json.dumps(ep), encoding="utf-8")
+    print(json.dumps({"kept_same": keep, "broken": brk, "flip": {c: (v["flip"], v["nt"]) for c, v in by.items()}, "ok": ok, "dose": dose}, indent=1))
+
+
+def mode_crossamdose(tag="crossam"):
+    """CROSS U step 4 for AM: the largest dose whose quality kept on the calibration rows (rows_crossuam_cal*) is >= base - 5 pp.
+    Adds uam, r1_uam, r2_uam (window 128-640, that dose; random sets: same layers, random neurons and signs) to arms_<tag>.json."""
+    rows = []
+    for f in (NE / "steer_am").glob("rows_crossuam_cal*.jsonl"):
+        rows += [json.loads(l) for l in f.open(encoding="utf-8")]
+    q, n, lk = Counter(), Counter(), Counter()
+    for r in rows:
+        n[r["arm"]] += 1
+        q[r["arm"]] += (r["end"] != "budget") and (not r["deg"]) and r["tool"]
+        lk[r["arm"]] += r["leak"]
+    qr = {a: q[a] / n[a] for a in n}
+    ok = [ds for ds in CROSS_DOSES if f"uam_d{ds}" in qr and qr[f"uam_d{ds}"] >= qr["base"] - 0.05]
+    dose = max(ok) if ok else min(CROSS_DOSES)
+    cal = json.loads((NE / "steer_am" / "arms_crossuam_cal.json").read_text(encoding="utf-8"))
+    pa = [tuple(x) for x in cal["picked"]]
+    rn = np.load(A / "search" / "am" / "refstats.npz")["resnorm"]
+    wn = np.load(NE / "dict.npz")["wnorm"]
+    f = NE / "steer_am" / f"arms_{tag}.json"
+    spec = json.loads(f.read_text(encoding="utf-8"))
+    if "uam" in spec["arms"]:
+        raise SystemExit("uam arms already in the spec")
+    for nm, ns in (("uam", pa), ("r1_uam", cross_random(pa, 151)), ("r2_uam", cross_random(pa, 152))):
+        spec["sets"][nm] = [[l, j, float(s * dose * rn[l] / wn[l, j]), 2.0] for l, j, s in ns]
+        spec["arms"][nm] = {"set": nm, "t0": 128, "t1": 640}
+    spec["uam_dose"] = dose
+    f.write_text(json.dumps(spec), encoding="utf-8")
+    print(json.dumps({"n": dict(n), "quality": qr, "leak": {a: lk[a] / n[a] for a in n}, "ok": ok, "dose": dose}, indent=1))
+
+
+def mode_amemcap():
+    """CROSS S2 capture: forward over every leaking prompt; per MLP neuron the mean activation over the target email (cross_target)
+    and over the other emails; token mean and sd over the other-email tokens of the selection prompts (not in CROSS_TEST).
+    -> ana/cross/amem.npz, amem_info.json"""
+    tok, model = C.load()
+    H = C.Hooked(model)
+    by = cross_am_units()
+    st = {"on": False, "off": 0, "tm": None, "om": None}
+    acc = {}
+
+    def pre(l):
+        def f(mod, args):
+            if not st["on"]:
+                return
+            x = args[0][0].float()
+            lo, T = st["off"], x.shape[0]
+            for name in ("tm", "om"):
+                mm = st[name][lo:lo + T]
+                if mm.any():
+                    xs = x[mm]
+                    acc[(name, "s", l)] = acc.get((name, "s", l), 0) + xs.sum(0)
+                    if name == "om":
+                        acc[("om", "q", l)] = acc.get(("om", "q", l), 0) + (xs * xs).sum(0)
+        return f
+    hs = [b.mlp.down_proj.register_forward_pre_hook(pre(l)) for l, b in enumerate(H.blocks)]
+    dev = C.first_device(model)
+    names, sel, TG, OT, info = [], [], [], [], []
+    S1 = torch.zeros(NL, NN, dtype=torch.float64, device="cuda")
+    S2 = torch.zeros(NL, NN, dtype=torch.float64, device="cuda")
+    ntok = 0
+    for cond, u in sorted(by.items()):
+        P = list(u["prompt_ids"])
+        em = am_email_spans2(tok, P)
+        tg, ot = np.zeros(len(P), bool), np.zeros(len(P), bool)
+        for e in em:
+            (tg if cross_target(e) else ot)[e["a"]:e["b"]] = True
+        if not tg.any() or ot.sum() < 8:
+            info.append({"condition": cond, "skipped": True, "emails": [[e["from"], e["to"], e["subject"]] for e in em]})
+            continue
+        st["tm"], st["om"] = torch.tensor(tg, device=dev), torch.tensor(ot, device=dev)
+        acc.clear()
+        st["on"] = True
+        with torch.inference_mode():
+            cache = None
+            for s in range(0, len(P), 1024):
+                st["off"] = s
+                o = model(input_ids=torch.tensor([P[s:s + 1024]], device=dev), past_key_values=cache, use_cache=True, logits_to_keep=1)
+                cache = o.past_key_values
+            del cache, o
+        st["on"] = False
+        nt, no = int(tg.sum()), int(ot.sum())
+        TG.append(torch.stack([acc[("tm", "s", l)] / nt for l in range(NL)]).half().cpu().numpy())
+        OT.append(torch.stack([acc[("om", "s", l)] / no for l in range(NL)]).half().cpu().numpy())
+        s_ = cond not in CROSS_TEST
+        if s_:
+            S1 += torch.stack([acc[("om", "s", l)] for l in range(NL)]).double()
+            S2 += torch.stack([acc[("om", "q", l)] for l in range(NL)]).double()
+            ntok += no
+        names.append(cond)
+        sel.append(s_)
+        info.append({"condition": cond, "selection": s_, "n_target": nt, "n_other": no,
+                     "targets": [f"{e['from']} -> {e['to']} | {e['subject']}" for e in em if cross_target(e)]})
+        C.log(f"amemcap {cond}: target {nt} tokens, other {no}, selection {s_}")
+    for h in hs:
+        h.remove()
+    mu = (S1 / ntok).float().cpu().numpy()
+    sd = ((S2 / ntok - (S1 / ntok) ** 2).clamp_min(0).sqrt() + 1e-3).float().cpu().numpy()
+    out = A / "cross"
+    out.mkdir(exist_ok=True)
+    np.savez(out / "amem.npz", names=np.array(names), sel=np.array(sel), tgt=np.stack(TG), oth=np.stack(OT), tok_mu=mu, tok_sd=sd)
+    (out / "amem_info.json").write_text(json.dumps(info, indent=1), encoding="utf-8")
+    (out / "AMEMCAP_DONE").touch()
+    C.log(f"AMEMCAP_DONE {len(names)} prompts ({sum(sel)} selection), {ntok} other-email tokens")
+
+
+def mode_amemsets(tag="crossam"):
+    """CROSS S2 selection (label-free): z = (target email mean - other emails mean) / token sd, median over the selection prompts,
+    top 1,024; limit = token mean + 1 sd; two same-layer random sets. -> ne/steer_am/arms_<tag>.json, ana/cross/amem_sets.json"""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(C.MODEL, revision=C.REV)
+    dic = np.load(NE / "dict.npz")
+    d = np.load(A / "cross" / "amem.npz")
+    sel, names = d["sel"].astype(bool), [str(x) for x in d["names"]]
+    mu, sd = d["tok_mu"].reshape(-1), d["tok_sd"].reshape(-1)
+    z = (d["tgt"].astype(np.float32).reshape(len(sel), -1) - d["oth"].astype(np.float32).reshape(len(sel), -1)) / sd
+    score = np.median(z[sel], 0)
+    order = np.argsort(-score)[:1024]
+
+    def mk(ids):
+        return [[int(i // NN), int(i % NN), float(mu[i] + sd[i])] for i in ids]
+    sets = {"em1024": mk(order)}
+    for k, seed in (("r1_em1024", 141), ("r2_em1024", 142)):
+        rng = np.random.default_rng(seed)
+        sets[k] = mk([int((i // NN) * NN + rng.integers(0, NN)) for i in order])
+    arms = {"base": None}
+    for k in sets:
+        arms[k] = {"kind": "clamp", "where": "em", "set": k}
+    f = NE / "steer_am" / f"arms_{tag}.json"
+    if f.exists():
+        raise SystemExit(f"{f} exists")
+    f.write_text(json.dumps({"arms": arms, "sets": sets, "conditions": list(CROSS_TEST), "seeds": 16, "seed_off": 17000, "budget": 6144,
+                             "extra_units": "extra_units_t9g.json"}), encoding="utf-8")
+    zt = z[~sel]
+    rep = {"selection_prompts": [n for n, s in zip(names, sel) if s], "test_prompts": [n for n, s in zip(names, sel) if not s],
+           "counts": {f"z>{t}": int((score > t).sum()) for t in (1, 2, 3)}, "layer_hist": sorted(Counter(int(i // NN) for i in order).items()),
+           "test_median_z_top1024": float(np.median(zt[:, order])) if len(zt) else None,
+           "top": [{"neuron": f"L{int(i // NN)}/N{int(i % NN)}", "z_sel": round(float(score[i]), 2), "words": words(tok, dic, int(i // NN), int(i % NN), 1, 8)} for i in order[:40]]}
+    (A / "cross" / "amem_sets.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(json.dumps({k: v for k, v in rep.items() if k != "top"}, ensure_ascii=False), "\n", json.dumps(rep["top"][:25], ensure_ascii=False, indent=0))
 
 
 def mode_amread(nk="1024"):
@@ -1885,5 +2553,7 @@ if __name__ == "__main__":
           "readgen": mode_readgen, "pathcheck": mode_pathcheck, "amread": mode_amread, "tacap": mode_tacap, "probes": mode_probes,
           "readgen2": mode_readgen2, "gensets": mode_gensets, "amdense": mode_amdense, "amdense_report": mode_amdense_report,
           "amfork": mode_amfork, "amfork_report": mode_amfork_report, "amgen": mode_amgen, "amscan": mode_amscan,
-          "amscan_report": mode_amscan_report}[sys.argv[1]]
+          "amscan_report": mode_amscan_report, "amwin": mode_amwin, "amwin_report": mode_amwin_report, "amwin_arms": mode_amwin_arms, "amdir_arms": mode_amdir_arms, "amprompts": mode_amprompts,
+          "crosssel": mode_crosssel, "crossdose": mode_crossdose, "amemcap": mode_amemcap, "amemsets": mode_amemsets,
+          "crossamdose": mode_crossamdose}[sys.argv[1]]
     fn(*sys.argv[2:])

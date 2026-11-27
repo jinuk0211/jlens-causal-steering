@@ -40,19 +40,49 @@ SETS = json.loads((A / "search" / "dojo" / "sets.json").read_text(encoding="utf-
 GATE_DET = False
 GATE_HN = False
 READ_CL = None
+GEN_AFTER_TOOL = False
 if ARM == "base":
     EDIT = {}
+elif ARM.endswith("_gtr"):
+    x = json.loads((A / "ne" / "steer_dojo" / os.environ["AB_ARMFILE"]).read_text(encoding="utf-8"))
+    sp = x["adds"][x["arms"][ARM]["add"]]
+    EDIT = {("attn" if sp["site"] == "mid" else "res", int(sp["layer"])): C.Edit("add", vec=torch.tensor(sp["vec"], dtype=torch.float32), alpha=1.0)}
+    GEN_AFTER_TOOL = True
+    C.log(f"arm {ARM}: residual add at layer {sp['layer']} site {sp['site']}, norm {float(np.linalg.norm(sp['vec'])):.2f}, onset + generated tokens of requests with a tool result")
+elif ARM.endswith("_rtr"):
+    import ab_ne as NEM
+    import ab_xfit as XF
+    EDIT = {}
+    x = json.loads((A / "ne" / "steer_dojo" / os.environ["AB_ARMFILE"]).read_text(encoding="utf-8"))
+    sp = x["adds"][x["arms"][ARM]["add"]]
+    READ_CL = XF.ReadAdd(H, sp["layer"], sp["site"], sp["vec"])
+    READ_LIM = None
+    C.log(f"arm {ARM}: residual add at layer {sp['layer']} site {sp['site']}, norm {float(np.linalg.norm(sp['vec'])):.2f}, tool-result positions only")
+elif ARM.endswith("_ntr"):
+    import ab_ne as NEM
+    EDIT = {}
+    x = json.loads((A / "ne" / "steer_dojo" / os.environ["AB_ARMFILE"]).read_text(encoding="utf-8"))
+    rspec = x["sets"][x["arms"][ARM]["set"]]
+    READ_CL = NEM.Steer(H)
+    READ_LIM = [(l, j, v, "tr") for l, j, v in rspec]
+    C.log(f"arm {ARM}: add-dose on {len(rspec)} MLP neurons at tool-result positions only (CROSS S1), dose {x.get('dose')}")
 elif ARM.endswith("_tr"):
     import ab_ne as NEM
     EDIT = {}
     rspec = None
-    for af in ("arms_s6a.json", "arms_s6b.json", "arms_s6g.json"):
+    afs = ("arms_s6a.json", "arms_s6b.json", "arms_s6g.json")
+    if os.environ.get("AB_ARMFILE", "-") != "-":
+        afs = (os.environ["AB_ARMFILE"],) + afs
+    for af in afs:
         if not (A / "ne" / "steer_dojo" / af).is_file():
             continue
         x = json.loads((A / "ne" / "steer_dojo" / af).read_text(encoding="utf-8"))
         if ARM[:-3] in x["sets"]:
             rspec = x["sets"][ARM[:-3]]
+            C.log(f"arm {ARM}: set {ARM[:-3]} from {af}, {len(rspec)} neurons")
             break
+    if rspec is None:
+        raise SystemExit(f"arm {ARM}: set {ARM[:-3]} not found in {afs}")
     READ_CL = NEM.Clamp(H)
     READ_LIM = [(l, j, v, "tr") for l, j, v in rspec]
 elif ARM.startswith("p_"):
@@ -82,7 +112,8 @@ elif ARM == "tail1024":
 else:
     EDIT = R.neur_edit(SETS[ARM], MU, H.nn)
 LOCK = threading.Lock()
-C.log(f"serve_steer arm {ARM} port {PORT}, detector gate {GATE_DET}")
+REQLOG = A / "logs" / f"reqids_{os.environ['AB_REQLOG']}_{PORT}.jsonl" if os.environ.get("AB_REQLOG", "-") != "-" else None
+C.log(f"serve_steer arm {ARM} port {PORT}, detector gate {GATE_DET}, request log {REQLOG}")
 
 
 def text_of(content):
@@ -172,6 +203,9 @@ def complete(req):
     ids = list(ids)
     t0 = time.time()
     with LOCK:
+        if REQLOG is not None:
+            with REQLOG.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"n_prompt": len(ids), "ids": ids}) + "\n")
         if GATE_HN:
             nf = len(HN.FIRES)
             gate = HN.HGate(tok, ["pdet"], "<function=")
@@ -190,7 +224,10 @@ def complete(req):
                     pc = o.past_key_values
                 del o
             READ_CL.mask = None
-        res = C.regen(model, tok, H, ids, [EDIT], BUDGET, lambda t, r: False, trigger=None, gate_fn=gate, prefix_cache=pc)[0]
+        edit = EDIT
+        if GEN_AFTER_TOOL and "<tool_response>" not in tok.decode(ids):
+            edit = {}
+        res = C.regen(model, tok, H, ids, [edit], BUDGET, lambda t, r: False, trigger=None, gate_fn=gate, prefix_cache=pc)[0]
         del pc
         fires = [round(s, 2) for _, s in HN.FIRES[nf:]] if GATE_HN else None
         torch.cuda.empty_cache()
